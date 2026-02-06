@@ -157,6 +157,47 @@ Provide curated prompts for common workflows (search → query → analytics).
 ### 3. Performance Tests
 - Benchmark common queries for latency and payload size.
 
+## Additional Findings from External Sources
+
+### 1. MCP Schema Guidance (Specification Repository)
+The official MCP schema emphasizes well-typed, explicit definitions for tool parameters,
+resource metadata, and message content. The schema’s structure reinforces:
+- **Typed payloads** for message content (text, image, audio) and a consistent envelope format.
+- **Annotations** for audience, priority, and timestamps to help clients prioritize or display content.
+- **Versioned schemas** to ensure compatibility and stable evolution of server capabilities.
+
+Source: [MCP schema (JSON Schema)](https://raw.githubusercontent.com/modelcontextprotocol/specification/main/schema/2025-11-25/schema.json).
+
+**EMS application:** Add structured metadata to responses where possible (e.g., “audience” or
+priority hints for critical errors), and align tool definitions with the schema to minimize
+client-side ambiguity.
+
+### 2. OWASP Top 10 for LLM Applications (Security Risks)
+OWASP’s LLM Top 10 highlights the most common, high-impact risks in AI systems:
+- **Prompt Injection (LLM01):** Crafted inputs can override intent or cause data exfiltration.
+- **Insecure Output Handling (LLM02):** Tool outputs should be validated before use.
+- **Insecure Plugin/Tool Design (LLM07):** Untrusted inputs and weak access control can lead
+  to security exploits.
+- **Sensitive Information Disclosure (LLM06):** Models and tools should minimize leakage of
+  secrets or personal data.
+
+Source: [OWASP Top 10 for LLM Applications](https://genai.owasp.org/llm-top-10/).
+
+**EMS application:** Validate all tool inputs, constrain output fields for non-privileged
+users, and add server-side allowlists for potentially dangerous parameters.
+
+### 3. NIST AI Risk Management Framework (Governance)
+The NIST AI RMF emphasizes organizational governance and risk lifecycle management:
+- Use structured governance to **map, measure, and manage** AI risks.
+- Establish **monitoring and feedback loops** to identify emerging failure modes.
+- Document risk assumptions, mitigations, and decision criteria for AI systems.
+
+Source: [NIST AI Risk Management Framework (AI RMF 1.0)](https://doi.org/10.6028/NIST.AI.100-1).
+
+**EMS application:** Establish a lightweight governance checklist for tool changes (schema
+updates, new tools, or access scopes), and document decision logs for sensitive tools or
+high-risk data exposure.
+
 ## Applying Best Practices to the EMS MCP Server
 
 ### 1. Tool Semantics
@@ -228,7 +269,10 @@ Provide curated prompts for common workflows (search → query → analytics).
 ## Reference Map (Non-Exhaustive)
 
 Common public sources that informed the patterns above:
-- MCP specification and SDK documentation (tool/resource/prompt design).
+- MCP specification and SDK documentation (tool/resource/prompt design): https://modelcontextprotocol.io
+- MCP schema (versioned JSON Schema for tool/resource definitions): https://raw.githubusercontent.com/modelcontextprotocol/specification/main/schema/2025-11-25/schema.json
 - LLM integration guidance from major providers (tool safety, prompt-injection mitigation).
 - API design best practices (pagination, retry logic, and error contracts).
 - Observability and reliability standards from SRE and API ops guides.
+- OWASP Top 10 for LLM Applications (prompt injection, insecure output handling, plugin risks): https://genai.owasp.org/llm-top-10/
+- NIST AI Risk Management Framework (governance, risk lifecycle management): https://doi.org/10.6028/NIST.AI.100-1
