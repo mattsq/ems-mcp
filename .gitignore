@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+
+# Caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Coverage
+.coverage
+htmlcov/
+
+# Credentials / local config
+.env
+
+# AI assistant configs (contain credentials)
+.gemini/
+.claude/
+
+# Reference R SDK (not part of this project)
+Rems2/
+
+# OS artifacts
+nul
+Thumbs.db
+.DS_Store
