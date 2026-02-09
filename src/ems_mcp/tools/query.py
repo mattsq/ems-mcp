@@ -4,13 +4,19 @@ These tools enable LLMs to query flight records from the Flight Data Warehouse
 and retrieve time-series analytics data for individual flights.
 """
 
+import csv
+import io
+import json
 import logging
 import re
 from typing import Any, Literal, NotRequired, TypedDict
 
+from fastmcp import Context
+
 from ems_mcp.api.client import EMSAPIError, EMSNotFoundError
 from ems_mcp.cache import field_cache, make_cache_key
 from ems_mcp.server import get_client, mcp
+from ems_mcp.tools.discovery import _resolve_database_id, _resolve_field_id
 
 logger = logging.getLogger(__name__)
 
@@ -163,7 +169,7 @@ VALID_AGGREGATES = frozenset({"avg", "count", "max", "min", "stdev", "sum", "var
 class QueryField(TypedDict):
     """A field to include in query results."""
 
-    field_id: str
+    field_id: str | int
     alias: NotRequired[str]
     aggregate: NotRequired[
         Literal["avg", "count", "max", "min", "stdev", "sum", "var"]
@@ -173,7 +179,7 @@ class QueryField(TypedDict):
 class QueryFilter(TypedDict):
     """A filter condition for a database query."""
 
-    field_id: str
+    field_id: str | int
     operator: Literal[
         "equal",
         "notEqual",
@@ -193,7 +199,7 @@ class QueryFilter(TypedDict):
 class QueryOrderBy(TypedDict):
     """Sort order for query results."""
 
-    field_id: str
+    field_id: str | int
     direction: NotRequired[Literal["asc", "desc"]]
 
 
@@ -421,15 +427,23 @@ def _build_query_body(
     Returns:
         EMS API query request body dict.
     """
-    # Build select array
+    # Build select array with emspy-compatible structure:
+    # - Every select entry gets "aggregate" (defaults to "none")
+    # - Non-aggregated fields go into a top-level "groupBy" array
+    has_aggregate = any(f.get("aggregate") for f in fields)
     select: list[dict[str, Any]] = []
+    group_by: list[dict[str, str]] = []
     for f in fields:
-        entry: dict[str, Any] = {"fieldId": f["field_id"]}
+        entry: dict[str, Any] = {
+            "fieldId": f["field_id"],
+            "aggregate": f.get("aggregate") or "none",
+        }
         if "alias" in f and f["alias"]:
             entry["alias"] = f["alias"]
-        if "aggregate" in f and f["aggregate"]:
-            entry["aggregate"] = f["aggregate"]
         select.append(entry)
+        # Non-aggregated fields become groupBy entries
+        if has_aggregate and not f.get("aggregate"):
+            group_by.append({"fieldId": f["field_id"]})
 
     # Map format to API value
     api_format = "none" if fmt == "raw" else "display"
@@ -439,6 +453,8 @@ def _build_query_body(
         "format": api_format,
         "top": limit,
     }
+    if group_by:
+        body["groupBy"] = group_by
 
     # Build filter
     if filters:
@@ -520,13 +536,7 @@ def _format_query_results(
     if not rows:
         return "Query returned 0 rows."
 
-    # Build column names: use alias if provided, otherwise header from response
-    col_names: list[str] = []
-    for i, h in enumerate(headers_raw):
-        if i < len(fields) and "alias" in fields[i] and fields[i]["alias"]:
-            col_names.append(fields[i]["alias"])
-        else:
-            col_names.append(h.get("name", f"Column {i}") if isinstance(h, dict) else str(h))
+    col_names = _extract_column_names(headers_raw, fields)
 
     # Convert cell values to strings, handling None/NULL
     str_rows: list[list[str]] = []
@@ -706,6 +716,264 @@ def _format_analytics_results(
     return output
 
 
+def _extract_column_names(
+    headers_raw: list[Any],
+    fields: list[QueryField],
+) -> list[str]:
+    """Extract column names from response headers, using aliases where available.
+
+    Args:
+        headers_raw: Raw header list from the API response.
+        fields: The fields that were queried (for alias support).
+
+    Returns:
+        List of column name strings.
+    """
+    col_names: list[str] = []
+    for i, h in enumerate(headers_raw):
+        if i < len(fields) and "alias" in fields[i] and fields[i]["alias"]:
+            col_names.append(fields[i]["alias"])
+        else:
+            col_names.append(
+                h.get("name", f"Column {i}") if isinstance(h, dict) else str(h)
+            )
+    return col_names
+
+
+def _format_query_results_csv(
+    response: dict[str, Any],
+    fields: list[QueryField],
+) -> str:
+    """Format database query results as CSV.
+
+    Args:
+        response: EMS API query response.
+        fields: The fields that were queried (for alias support).
+
+    Returns:
+        CSV-formatted string.
+    """
+    rows = response.get("rows", [])
+    headers_raw = response.get("header", [])
+
+    if not rows:
+        return "Query returned 0 rows."
+
+    col_names = _extract_column_names(headers_raw, fields)
+
+    output = io.StringIO()
+    writer = csv.writer(output, quoting=csv.QUOTE_MINIMAL)
+    writer.writerow(col_names)
+    for row in rows:
+        writer.writerow(["" if cell is None else cell for cell in row])
+
+    output.write(f"\n({len(rows)} row(s) returned)")
+    return output.getvalue()
+
+
+def _format_query_results_json(
+    response: dict[str, Any],
+    fields: list[QueryField],
+) -> str:
+    """Format database query results as compact JSON.
+
+    Args:
+        response: EMS API query response.
+        fields: The fields that were queried (for alias support).
+
+    Returns:
+        JSON-formatted string with columns, rows, and row_count.
+    """
+    rows = response.get("rows", [])
+    headers_raw = response.get("header", [])
+
+    if not rows:
+        return '{"columns":[],"rows":[],"row_count":0}'
+
+    col_names = _extract_column_names(headers_raw, fields)
+
+    row_dicts = []
+    for row in rows:
+        row_dict: dict[str, Any] = {}
+        for i, col in enumerate(col_names):
+            row_dict[col] = row[i] if i < len(row) else None
+        row_dicts.append(row_dict)
+
+    result = {
+        "columns": col_names,
+        "rows": row_dicts,
+        "row_count": len(rows),
+    }
+    return json.dumps(result, separators=(",", ":"))
+
+
+def _format_analytics_results_csv(
+    results: list[dict[str, Any]],
+    max_rows_per_flight: int = 200,
+    analytic_names: list[str] | None = None,
+) -> str:
+    """Format analytics results as CSV with per-flight comment headers.
+
+    Args:
+        results: List of per-flight result dicts.
+        max_rows_per_flight: Maximum display rows per flight.
+        analytic_names: Optional display names for analytics columns.
+
+    Returns:
+        CSV-formatted string.
+    """
+    if not results:
+        return "No analytics results."
+
+    output = io.StringIO()
+    writer = csv.writer(output, quoting=csv.QUOTE_MINIMAL)
+
+    for r in results:
+        flight_id = r.get("flight_id", "?")
+        output.write(f"# Flight {flight_id}\n")
+
+        if "error" in r:
+            output.write(f"# Error: {r['error']}\n")
+            continue
+
+        data = r.get("data", {})
+        offsets = data.get("offsets", [])
+        analytic_results = data.get("results", [])
+
+        if not offsets:
+            output.write("# No data returned.\n")
+            continue
+
+        # Column headers
+        col_names = ["Offset"]
+        for i, ar in enumerate(analytic_results):
+            if analytic_names and i < len(analytic_names):
+                col_names.append(analytic_names[i])
+            else:
+                raw_id = str(ar.get("analyticId", f"Analytic_{i}"))
+                col_names.append(_format_analytic_header(raw_id))
+
+        writer.writerow(col_names)
+
+        # All-zero warning
+        total_rows = len(offsets)
+        if total_rows >= 100 and analytic_results:
+            all_zero = all(
+                all(v == 0.0 or v is None for v in ar.get("values", []))
+                for ar in analytic_results
+            )
+            if all_zero:
+                output.write(
+                    "# WARNING: All analytic values are 0.0. "
+                    "This may indicate an invalid flight ID.\n"
+                )
+
+        # Data rows
+        display_count = min(total_rows, max_rows_per_flight)
+        for i in range(display_count):
+            row: list[Any] = [offsets[i]]
+            for ar in analytic_results:
+                values = ar.get("values", [])
+                row.append(values[i] if i < len(values) else "")
+            writer.writerow(row)
+
+        if total_rows > max_rows_per_flight:
+            output.write(
+                f"# ... ({total_rows - max_rows_per_flight} more rows, "
+                f"{total_rows} total)\n"
+            )
+        else:
+            output.write(f"# ({total_rows} row(s))\n")
+
+    return output.getvalue()
+
+
+def _format_analytics_results_json(
+    results: list[dict[str, Any]],
+    max_rows_per_flight: int = 200,
+    analytic_names: list[str] | None = None,
+) -> str:
+    """Format analytics results as compact JSON.
+
+    Args:
+        results: List of per-flight result dicts.
+        max_rows_per_flight: Maximum display rows per flight.
+        analytic_names: Optional display names for analytics columns.
+
+    Returns:
+        JSON-formatted string with flights and warnings.
+    """
+    if not results:
+        return '{"flights":[],"warnings":[]}'
+
+    flights_out: list[dict[str, Any]] = []
+    warnings: list[str] = []
+
+    for r in results:
+        flight_id = r.get("flight_id", "?")
+
+        if "error" in r:
+            flights_out.append({
+                "flight_id": flight_id,
+                "error": r["error"],
+            })
+            continue
+
+        data = r.get("data", {})
+        offsets = data.get("offsets", [])
+        analytic_results = data.get("results", [])
+
+        if not offsets:
+            flights_out.append({
+                "flight_id": flight_id,
+                "rows": [],
+                "row_count": 0,
+            })
+            continue
+
+        # Column names
+        col_names = []
+        for i, ar in enumerate(analytic_results):
+            if analytic_names and i < len(analytic_names):
+                col_names.append(analytic_names[i])
+            else:
+                raw_id = str(ar.get("analyticId", f"Analytic_{i}"))
+                col_names.append(_format_analytic_header(raw_id))
+
+        # All-zero warning
+        total_rows = len(offsets)
+        if total_rows >= 100 and analytic_results:
+            all_zero = all(
+                all(v == 0.0 or v is None for v in ar.get("values", []))
+                for ar in analytic_results
+            )
+            if all_zero:
+                warnings.append(
+                    f"Flight {flight_id}: All analytic values are 0.0. "
+                    "This may indicate an invalid flight ID."
+                )
+
+        # Build rows
+        display_count = min(total_rows, max_rows_per_flight)
+        row_dicts = []
+        for i in range(display_count):
+            row_dict: dict[str, Any] = {"Offset": offsets[i]}
+            for j, ar in enumerate(analytic_results):
+                values = ar.get("values", [])
+                col = col_names[j] if j < len(col_names) else f"Analytic_{j}"
+                row_dict[col] = values[i] if i < len(values) else None
+            row_dicts.append(row_dict)
+
+        flights_out.append({
+            "flight_id": flight_id,
+            "rows": row_dicts,
+            "row_count": total_rows,
+        })
+
+    result = {"flights": flights_out, "warnings": warnings}
+    return json.dumps(result, separators=(",", ":"))
+
+
 @mcp.tool
 async def query_database(
     ems_system_id: int,
@@ -715,46 +983,45 @@ async def query_database(
     order_by: list[QueryOrderBy] | None = None,
     limit: int = 100,
     format: str = "display",
+    output_format: str = "table",
+    ctx: Context | None = None,
 ) -> str:
-    """Execute a database query to retrieve flight records.
+    """Query flight records from a database.
 
-    Query the Flight Data Warehouse or other databases. Field IDs must be
-    discovered first using search_fields or list_fields.
+    Accepts field names (e.g. "Flight Date"), [N] reference numbers from
+    find_fields, or raw bracket-encoded IDs. Database names (e.g. "FDW Flights")
+    are also resolved automatically.
 
-    Supports server-side aggregation: add an "aggregate" key to any field
-    (avg, count, max, min, stdev, sum, var). Fields without an aggregate
-    act as implicit GROUP BY columns. This avoids downloading thousands of
-    rows for statistical summaries.
-
-    Discrete field filters accept string labels (e.g. "DHC-8-400") which
-    are automatically resolved to numeric codes via the field metadata API.
+    Supports aggregation (avg/count/max/min/stdev/sum/var) and discrete filter
+    auto-resolution (string labels resolved to numeric codes automatically).
 
     Args:
-        ems_system_id: The EMS system ID (from list_ems_systems).
-        database_id: Database ID (typically FDW Flights, from list_databases).
-        fields: Fields to retrieve. Each must have a field_id and optional alias
-            and optional aggregate (avg, count, max, min, stdev, sum, var).
-        filters: Optional filter conditions combined with AND. Each has field_id,
-            operator (equal, notEqual, greaterThan, greaterThanOrEqual, lessThan,
-            lessThanOrEqual, in, isNull, isNotNull, like, between), and value.
-            String values for discrete fields are auto-resolved to numeric codes.
-        order_by: Optional sort order. Each has field_id and optional direction (asc/desc).
-        limit: Maximum rows to return (1-10000, default: 100).
-        format: Value format - 'display' for human-readable labels (default),
-            'raw' for numeric codes.
+        ems_system_id: EMS system ID.
+        database_id: Database ID or name (e.g. "FDW Flights").
+        fields: Fields to retrieve. Each has field_id (name, [N] ref, or
+            bracket ID), optional alias, optional aggregate.
+        filters: Filter conditions (AND-combined). Each has field_id, operator
+            (equal/notEqual/greaterThan/lessThan/between/in/like/isNull/etc.), value.
+        order_by: Sort order. Each has field_id, optional direction (asc/desc).
+        limit: Max rows (1-10000, default: 100).
+        format: 'display' (human-readable, default) or 'raw' (numeric codes).
+        output_format: 'table' (default), 'csv' (compact), or 'json' (structured).
 
     Returns:
-        Query results as a formatted text table with column headers and row count.
+        Results in the requested output format.
     """
     # Validate inputs
     if not fields:
-        return "Error: At least one field is required. Use search_fields to find field IDs."
+        return "Error: At least one field is required. Use find_fields to discover field IDs."
 
     if limit < 1 or limit > 10000:
         return "Error: limit must be between 1 and 10000."
 
     if format not in ("display", "raw"):
         return "Error: format must be 'display' or 'raw'."
+
+    if output_format not in ("table", "csv", "json"):
+        return "Error: output_format must be 'table', 'csv', or 'json'."
 
     # Validate aggregate values
     for f in fields:
@@ -774,14 +1041,62 @@ async def query_database(
                     f"Valid operators: {', '.join(sorted(VALID_OPERATORS))}"
                 )
 
+    # Resolve database name -> ID
+    try:
+        database_id = await _resolve_database_id(database_id, ems_system_id)
+    except ValueError as e:
+        return f"Error resolving database: {e}"
+
+    # Resolve field references -> opaque IDs
+    try:
+        resolved_fields: list[QueryField] = []
+        for f in fields:
+            resolved_id = await _resolve_field_id(
+                f["field_id"], ems_system_id, database_id
+            )
+            resolved_fields.append({**f, "field_id": resolved_id})
+        fields = resolved_fields
+    except (ValueError, EMSAPIError) as e:
+        return f"Error resolving field: {e}"
+
+    # Resolve field references in filters
+    if filters:
+        try:
+            resolved_filters: list[QueryFilter] = []
+            for f in filters:
+                resolved_id = await _resolve_field_id(
+                    f["field_id"], ems_system_id, database_id
+                )
+                resolved_filters.append({**f, "field_id": resolved_id})
+            filters = resolved_filters
+        except (ValueError, EMSAPIError) as e:
+            return f"Error resolving filter field: {e}"
+
+    # Resolve field references in order_by
+    if order_by:
+        try:
+            resolved_order: list[QueryOrderBy] = []
+            for ob in order_by:
+                resolved_id = await _resolve_field_id(
+                    ob["field_id"], ems_system_id, database_id
+                )
+                resolved_order.append({**ob, "field_id": resolved_id})
+            order_by = resolved_order
+        except (ValueError, EMSAPIError) as e:
+            return f"Error resolving order_by field: {e}"
+
     # Resolve discrete filter values (string labels -> numeric codes)
     if filters:
+        if ctx:
+            await ctx.report_progress(1, 3, "Resolving filter values...")
         try:
             filters = await _resolve_filters(filters, ems_system_id, database_id)
         except ValueError as e:
             return f"Error resolving filter value: {e}"
 
     # Build query body
+    if ctx:
+        await ctx.report_progress(2, 3, "Executing query...")
     try:
         body = _build_query_body(fields, filters, order_by, limit, format)
     except ValueError as e:
@@ -791,8 +1106,23 @@ async def query_database(
     path = f"/api/v2/ems-systems/{ems_system_id}/databases/{database_id}/query"
 
     try:
+        if ctx:
+            await ctx.info(
+                f"Querying database {database_id} with {len(fields)} field(s), "
+                f"limit={limit}",
+                logger_name="ems_mcp.query",
+            )
         response = await client.post(path, json=body)
-        return _format_query_results(response, fields)
+        if ctx:
+            row_count = len(response.get("rows", []))
+            await ctx.report_progress(3, 3, f"Formatting {row_count} rows...")
+
+        if output_format == "csv":
+            return _format_query_results_csv(response, fields)
+        elif output_format == "json":
+            return _format_query_results_json(response, fields)
+        else:
+            return _format_query_results(response, fields)
     except EMSNotFoundError:
         return (
             f"Error: Database or system not found. "
@@ -803,7 +1133,7 @@ async def query_database(
         if e.status_code == 400:
             return (
                 f"Error: Bad query request - {e.message}. "
-                "Check that field IDs are valid (use search_fields) and "
+                "Check that field IDs are valid (use find_fields) and "
                 "filter values match field types (use get_field_info for discrete mappings)."
             )
         return f"Error executing query: {e.message}"
@@ -817,25 +1147,26 @@ async def query_flight_analytics(
     start_offset: float | None = None,
     end_offset: float | None = None,
     sample_rate: float = 1.0,
+    output_format: str = "table",
+    ctx: Context | None = None,
 ) -> str:
-    """Query time-series analytics data for one or more flights.
+    """Get time-series data (altitude, airspeed, etc.) for specific flights.
 
-    Retrieves time-series data (altitude, airspeed, etc.) for specific flights.
-    Flight IDs come from query_database. Analytics can be specified as either
-    human-readable names (e.g. "Airspeed") or raw analytic IDs from search_analytics.
-    When names are used, they are resolved automatically and displayed as column headers.
+    Flight IDs come from query_database. Accepts human-readable analytic names
+    (e.g. "Airspeed") which are resolved automatically, or raw IDs from
+    search_analytics.
 
     Args:
-        ems_system_id: The EMS system ID (from list_ems_systems).
-        flight_ids: Flight record IDs to query (max 10, from query_database).
-        analytics: Analytic names or IDs to retrieve (max 20). Accepts human-readable
-            names like "Airspeed" or raw IDs from search_analytics.
-        start_offset: Optional start time in seconds from flight start.
-        end_offset: Optional end time in seconds from flight start.
-        sample_rate: Samples per second (default: 1.0, must be > 0).
+        ems_system_id: EMS system ID.
+        flight_ids: Flight record IDs (max 10, from query_database).
+        analytics: Analytic names or IDs (max 20). e.g. ["Airspeed", "Altitude"].
+        start_offset: Start time in seconds from flight start.
+        end_offset: End time in seconds from flight start.
+        sample_rate: Samples per second (default: 1.0).
+        output_format: 'table' (default), 'csv' (compact), or 'json' (structured).
 
     Returns:
-        Time-series data formatted as per-flight tables with offset and analytic columns.
+        Per-flight time-series data in the requested output format.
     """
     # Validate inputs
     if not flight_ids:
@@ -856,10 +1187,17 @@ async def query_flight_analytics(
     if sample_rate <= 0:
         return "Error: sample_rate must be greater than 0."
 
+    if output_format not in ("table", "csv", "json"):
+        return "Error: output_format must be 'table', 'csv', or 'json'."
+
     if start_offset is not None and end_offset is not None and start_offset >= end_offset:
         return "Error: start_offset must be less than end_offset."
 
+    total_steps = len(flight_ids) + 1  # 1 for resolution, N for flights
+
     # Resolve analytic names to IDs
+    if ctx:
+        await ctx.report_progress(0, total_steps, "Resolving analytic names...")
     try:
         resolved = await _resolve_analytics(analytics, ems_system_id)
     except ValueError as e:
@@ -875,7 +1213,12 @@ async def query_flight_analytics(
 
     results: list[dict[str, Any]] = []
 
-    for fid in flight_ids:
+    for i, fid in enumerate(flight_ids):
+        if ctx:
+            await ctx.report_progress(
+                i + 1, total_steps,
+                f"Querying flight {fid} ({i + 1}/{len(flight_ids)})...",
+            )
         path = f"/api/v2/ems-systems/{ems_system_id}/flights/{fid}/analytics/query"
         try:
             data = await client.post(path, json=body)
@@ -895,13 +1238,24 @@ async def query_flight_analytics(
                 }
             )
 
+    if ctx:
+        await ctx.report_progress(total_steps, total_steps, "Formatting results...")
+
+    # Select formatter
+    if output_format == "csv":
+        formatter = _format_analytics_results_csv
+    elif output_format == "json":
+        formatter = _format_analytics_results_json
+    else:
+        formatter = _format_analytics_results
+
     # If all flights failed, mention it prominently
     if all("error" in r for r in results):
-        formatted = _format_analytics_results(results, analytic_names=display_names)
+        formatted = formatter(results, analytic_names=display_names)
         return (
             f"All {len(flight_ids)} flight(s) failed. "
             "Verify flight IDs (from query_database) and analytic IDs (from search_analytics).\n\n"
             + formatted
         )
 
-    return _format_analytics_results(results, analytic_names=display_names)
+    return formatter(results, analytic_names=display_names)

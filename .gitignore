@@ -26,6 +26,7 @@ htmlcov/
 
 # Reference R SDK (not part of this project)
 Rems2/
+emspy/
 
 # OS artifacts
 nul

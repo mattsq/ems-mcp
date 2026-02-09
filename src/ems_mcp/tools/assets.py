@@ -1,11 +1,10 @@
 """Asset tools for EMS MCP server.
 
-These tools enable LLMs to retrieve reference data about fleets, aircraft,
-flight phases, and airports from the EMS system.
+Provides access to reference data: fleets, aircraft, airports, and flight phases.
 """
 
 import logging
-from typing import Any
+from typing import Any, Literal
 
 from ems_mcp.api.client import EMSAPIError, EMSNotFoundError
 from ems_mcp.server import get_client, mcp
@@ -88,103 +87,57 @@ def _format_airports(airports: list[dict[str, Any]]) -> str:
 
 
 @mcp.tool
-async def list_fleets(ems_system_id: int) -> str:
-    """List aircraft fleets available in the EMS system.
-
-    Fleets are groups of aircraft that share common characteristics.
-
-    Args:
-        ems_system_id: The EMS system ID (from list_ems_systems).
-
-    Returns:
-        Formatted list of fleets with their IDs and descriptions.
-    """
-    client = get_client()
-    try:
-        path = f"/api/v2/ems-systems/{ems_system_id}/assets/fleets"
-        fleets = await client.get(path)
-        return _format_fleets(fleets)
-    except EMSNotFoundError:
-        return f"Error: EMS system {ems_system_id} not found."
-    except EMSAPIError as e:
-        return f"Error listing fleets: {e.message}"
-
-
-@mcp.tool
-async def list_aircraft(
+async def get_assets(
     ems_system_id: int,
+    asset_type: Literal["fleets", "aircraft", "airports", "flight_phases"],
     fleet_id: int | None = None,
 ) -> str:
-    """List aircraft in the EMS system.
-
-    Returns aircraft identifiers (tail numbers) and their associated fleets.
+    """Get reference data: fleets, aircraft, airports, or flight phases.
 
     Args:
-        ems_system_id: The EMS system ID.
-        fleet_id: Optional: filter to specific fleet ID.
+        ems_system_id: EMS system ID (from list_ems_systems).
+        asset_type: Type of assets to retrieve.
+        fleet_id: Filter aircraft by fleet ID (only for asset_type="aircraft").
 
     Returns:
-        Formatted list of aircraft with their IDs and fleets.
+        Formatted list of the requested asset type.
     """
     client = get_client()
+
     try:
-        path = f"/api/v2/ems-systems/{ems_system_id}/assets/aircraft"
-        params = {}
-        if fleet_id is not None:
-            params["fleetId"] = fleet_id
+        if asset_type == "fleets":
+            path = f"/api/v2/ems-systems/{ems_system_id}/assets/fleets"
+            data = await client.get(path)
+            return _format_fleets(data)
 
-        aircraft = await client.get(path, params=params)
-        return _format_aircraft(aircraft)
-    except EMSNotFoundError:
-        return "Error: EMS system or fleet not found."
-    except EMSAPIError as e:
-        return f"Error listing aircraft: {e.message}"
+        elif asset_type == "aircraft":
+            path = f"/api/v2/ems-systems/{ems_system_id}/assets/aircraft"
+            params: dict[str, Any] = {}
+            if fleet_id is not None:
+                params["fleetId"] = fleet_id
+            data = await client.get(path, params=params)
+            return _format_aircraft(data)
 
+        elif asset_type == "airports":
+            path = f"/api/v2/ems-systems/{ems_system_id}/assets/airports"
+            data = await client.get(path)
+            return _format_airports(data)
 
-@mcp.tool
-async def list_flight_phases(ems_system_id: int) -> str:
-    """List flight phases used in the EMS system.
+        elif asset_type == "flight_phases":
+            path = f"/api/v2/ems-systems/{ems_system_id}/assets/flight-phases"
+            data = await client.get(path)
+            return _format_flight_phases(data)
 
-    Flight phases divide flights into logical segments (Takeoff, Climb, Cruise, etc.).
+        else:
+            return (
+                f"Error: Unknown asset_type '{asset_type}'. "
+                "Valid types: fleets, aircraft, airports, flight_phases."
+            )
 
-    Args:
-        ems_system_id: The EMS system ID.
-
-    Returns:
-        Formatted list of flight phases with their IDs and descriptions.
-    """
-    client = get_client()
-    try:
-        path = f"/api/v2/ems-systems/{ems_system_id}/assets/flight-phases"
-        phases = await client.get(path)
-        return _format_flight_phases(phases)
-    except EMSNotFoundError:
-        return f"Error: EMS system {ems_system_id} not found."
-    except EMSAPIError as e:
-        return f"Error listing flight phases: {e.message}"
-
-
-@mcp.tool
-async def list_airports(ems_system_id: int) -> str:
-    """List airports known to the EMS system.
-
-    Returns airport names, codes (ICAO/IATA), and locations.
-
-    Args:
-        ems_system_id: The EMS system ID.
-
-    Returns:
-        Formatted list of airports.
-    """
-    client = get_client()
-    try:
-        path = f"/api/v2/ems-systems/{ems_system_id}/assets/airports"
-        airports = await client.get(path)
-        return _format_airports(airports)
     except EMSNotFoundError:
         return f"Error: EMS system {ems_system_id} not found."
     except EMSAPIError as e:
-        return f"Error listing airports: {e.message}"
+        return f"Error getting {asset_type}: {e.message}"
 
 
 @mcp.tool
@@ -192,10 +145,10 @@ async def ping_system(ems_system_id: int) -> str:
     """Check if an EMS system is online and responsive.
 
     Args:
-        ems_system_id: The EMS system ID.
+        ems_system_id: EMS system ID.
 
     Returns:
-        System status and server response timestamp.
+        System status.
     """
     client = get_client()
     try:

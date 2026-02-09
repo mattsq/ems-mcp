@@ -62,12 +62,40 @@ async def lifespan(app: FastMCP) -> AsyncIterator[dict[str, Any]]:
 # Create the FastMCP server instance
 mcp = FastMCP(
     name="ems-mcp",
-    version="0.1.0",
-    instructions=(
-        "MCP server providing LLM access to the EMS (Engine Monitoring System) API "
-        "for flight data analytics. Enables discovery of EMS systems, databases, and fields; "
-        "querying flight records; and retrieving time-series analytics data."
-    ),
+    version="0.2.0",
+    instructions="""\
+EMS flight data analytics server. Follow this workflow:
+
+DISCOVERY (required before querying):
+1. list_ems_systems -> get system ID (usually 1)
+2. list_databases -> find database names (e.g. "FDW Flights")
+3. find_fields(mode="search") -> find fields by keyword
+4. get_field_info -> check discrete value codes for filtering
+
+FIELD REFERENCES:
+- find_fields returns numbered [N] references. Use these directly in \
+query_database, get_field_info, etc. -- no need to retrieve raw IDs.
+- You can also pass field names (e.g. "Takeoff Airport Name") and \
+database names (e.g. "FDW Flights") -- they are resolved automatically.
+
+OUTPUT FORMATS:
+- query_database and query_flight_analytics accept output_format: \
+'table' (default), 'csv' (compact), or 'json' (structured).
+
+QUERYING:
+- query_database: SQL-like queries on flight records. Supports filters, \
+aggregation (avg/count/max/min/sum), and sorting.
+- query_flight_analytics: Time-series data (altitude, airspeed, etc.) \
+for specific flights. Accepts human-readable analytic names.
+
+KEY RULES:
+- Discrete fields use numeric codes internally. Use get_field_info to see \
+code-to-label mappings, or pass string labels in filters (auto-resolved).
+- Entity-type databases don't support field search. Use \
+find_fields(mode="deep") for BFS traversal, or mode="browse" to navigate.
+- get_assets returns reference data (fleets, aircraft, airports, flight phases).
+- Use search_analytics to find time-series parameter names before querying.
+""",
     lifespan=lifespan,
 )
 
@@ -95,8 +123,10 @@ def run() -> None:
     mcp.run()
 
 
-# Import tools to register them with the mcp instance
+# Import tools and resources to register them with the mcp instance
 # This must happen after mcp is created
 import ems_mcp.tools.assets  # noqa: E402, F401
 import ems_mcp.tools.discovery  # noqa: E402, F401
 import ems_mcp.tools.query  # noqa: E402, F401
+import ems_mcp.prompts  # noqa: E402, F401
+import ems_mcp.resources  # noqa: E402, F401

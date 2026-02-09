@@ -5,12 +5,18 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from ems_mcp.tools.query import (
+    QueryField,
     _build_analytics_body,
     _build_query_body,
     _build_single_filter,
+    _extract_column_names,
     _format_analytic_header,
     _format_analytics_results,
+    _format_analytics_results_csv,
+    _format_analytics_results_json,
     _format_query_results,
+    _format_query_results_csv,
+    _format_query_results_json,
     _get_field_metadata,
     _is_analytic_id,
     _resolve_analytics,
@@ -143,11 +149,12 @@ class TestBuildQueryBody:
             limit=100,
             fmt="display",
         )
-        assert body["select"] == [{"fieldId": "f1"}]
+        assert body["select"] == [{"fieldId": "f1", "aggregate": "none"}]
         assert body["format"] == "display"
         assert body["top"] == 100
         assert "filter" not in body
         assert "orderBy" not in body
+        assert "groupBy" not in body
 
     def test_query_with_alias(self) -> None:
         """Fields with aliases should include them."""
@@ -158,7 +165,7 @@ class TestBuildQueryBody:
             limit=50,
             fmt="display",
         )
-        assert body["select"] == [{"fieldId": "f1", "alias": "Flight Date"}]
+        assert body["select"] == [{"fieldId": "f1", "aggregate": "none", "alias": "Flight Date"}]
 
     def test_raw_format_maps_to_none(self) -> None:
         """Raw format should map to 'none' in API."""
@@ -394,6 +401,13 @@ class TestFormatAnalyticsResults:
 class TestQueryDatabase:
     """Tests for query_database tool."""
 
+    @pytest.fixture(autouse=True)
+    async def clear_cache(self) -> None:
+        """Clear caches before each test."""
+        from ems_mcp.cache import field_cache, database_cache
+        await field_cache.clear()
+        await database_cache.clear()
+
     @pytest.mark.asyncio
     async def test_success(self) -> None:
         """Tool should execute query and return formatted table."""
@@ -406,16 +420,14 @@ class TestQueryDatabase:
         with patch("ems_mcp.tools.query.get_client", return_value=mock_client):
             result = await _query_database(
                 ems_system_id=1,
-                database_id="ems-core",
-                fields=[{"field_id": "f1"}, {"field_id": "f2"}],
+                database_id="[ems-core]",
+                fields=[{"field_id": "[f1]"}, {"field_id": "[f2]"}],
             )
 
         assert "Flight Date" in result
         assert "2024-01-15" in result
         assert "2 row(s)" in result
         mock_client.post.assert_called_once()
-        call_args = mock_client.post.call_args
-        assert call_args[0][0] == "/api/v2/ems-systems/1/databases/ems-core/query"
 
     @pytest.mark.asyncio
     async def test_with_filters(self) -> None:
@@ -429,9 +441,9 @@ class TestQueryDatabase:
         with patch("ems_mcp.tools.query.get_client", return_value=mock_client):
             await _query_database(
                 ems_system_id=1,
-                database_id="db",
-                fields=[{"field_id": "f1"}],
-                filters=[{"field_id": "f2", "operator": "equal", "value": 42}],
+                database_id="[db]",
+                fields=[{"field_id": "[f1]"}],
+                filters=[{"field_id": "[f2]", "operator": "equal", "value": 42}],
             )
 
         call_body = mock_client.post.call_args[1]["json"]
@@ -443,7 +455,7 @@ class TestQueryDatabase:
         """Tool should reject empty fields list."""
         result = await _query_database(
             ems_system_id=1,
-            database_id="db",
+            database_id="[db]",
             fields=[],
         )
         assert "Error" in result
@@ -454,8 +466,8 @@ class TestQueryDatabase:
         """Tool should reject limit > 10000."""
         result = await _query_database(
             ems_system_id=1,
-            database_id="db",
-            fields=[{"field_id": "f1"}],
+            database_id="[db]",
+            fields=[{"field_id": "[f1]"}],
             limit=20000,
         )
         assert "Error" in result
@@ -466,8 +478,8 @@ class TestQueryDatabase:
         """Tool should reject limit < 1."""
         result = await _query_database(
             ems_system_id=1,
-            database_id="db",
-            fields=[{"field_id": "f1"}],
+            database_id="[db]",
+            fields=[{"field_id": "[f1]"}],
             limit=0,
         )
         assert "Error" in result
@@ -478,8 +490,8 @@ class TestQueryDatabase:
         """Tool should reject invalid format."""
         result = await _query_database(
             ems_system_id=1,
-            database_id="db",
-            fields=[{"field_id": "f1"}],
+            database_id="[db]",
+            fields=[{"field_id": "[f1]"}],
             format="json",
         )
         assert "Error" in result
@@ -496,8 +508,8 @@ class TestQueryDatabase:
         with patch("ems_mcp.tools.query.get_client", return_value=mock_client):
             result = await _query_database(
                 ems_system_id=999,
-                database_id="invalid",
-                fields=[{"field_id": "f1"}],
+                database_id="[invalid]",
+                fields=[{"field_id": "[f1]"}],
             )
 
         assert "Error" in result
@@ -516,12 +528,12 @@ class TestQueryDatabase:
         with patch("ems_mcp.tools.query.get_client", return_value=mock_client):
             result = await _query_database(
                 ems_system_id=1,
-                database_id="db",
-                fields=[{"field_id": "bad-id"}],
+                database_id="[db]",
+                fields=[{"field_id": "[bad-id]"}],
             )
 
         assert "Error" in result
-        assert "search_fields" in result
+        assert "find_fields" in result
         assert "get_field_info" in result
 
     @pytest.mark.asyncio
@@ -529,9 +541,9 @@ class TestQueryDatabase:
         """Tool should reject unknown filter operators."""
         result = await _query_database(
             ems_system_id=1,
-            database_id="db",
-            fields=[{"field_id": "f1"}],
-            filters=[{"field_id": "f2", "operator": "contains", "value": "x"}],
+            database_id="[db]",
+            fields=[{"field_id": "[f1]"}],
+            filters=[{"field_id": "[f2]", "operator": "contains", "value": "x"}],
         )
         assert "Error" in result
         assert "Invalid filter operator" in result
@@ -544,12 +556,24 @@ class TestQueryDatabase:
         with patch("ems_mcp.tools.query.get_client", return_value=mock_client):
             result = await _query_database(
                 ems_system_id=1,
-                database_id="db",
-                fields=[{"field_id": "f1"}],
-                filters=[{"field_id": "f2", "operator": "between", "value": 42}],
+                database_id="[db]",
+                fields=[{"field_id": "[f1]"}],
+                filters=[{"field_id": "[f2]", "operator": "between", "value": 42}],
             )
 
         assert "Error building query" in result
+
+    @pytest.mark.asyncio
+    async def test_invalid_output_format(self) -> None:
+        """Tool should reject invalid output_format."""
+        result = await _query_database(
+            ems_system_id=1,
+            database_id="[db]",
+            fields=[{"field_id": "[f1]"}],
+            output_format="xml",
+        )
+        assert "Error" in result
+        assert "output_format" in result
 
 
 class TestQueryFlightAnalytics:
@@ -1110,7 +1134,7 @@ class TestBuildQueryBodyAggregation:
         assert body["select"] == [{"fieldId": "f1", "aggregate": "avg"}]
 
     def test_mixed_aggregate_and_plain(self) -> None:
-        """Mix of aggregated and non-aggregated fields (implicit GROUP BY)."""
+        """Mix of aggregated and non-aggregated fields should produce top-level groupBy."""
         body = _build_query_body(
             fields=[
                 {"field_id": "group_field"},
@@ -1122,9 +1146,10 @@ class TestBuildQueryBodyAggregation:
             limit=100,
             fmt="display",
         )
-        assert body["select"][0] == {"fieldId": "group_field"}
+        assert body["select"][0] == {"fieldId": "group_field", "aggregate": "none"}
         assert body["select"][1] == {"fieldId": "value_field", "aggregate": "sum"}
         assert body["select"][2] == {"fieldId": "count_field", "aggregate": "count"}
+        assert body["groupBy"] == [{"fieldId": "group_field"}]
 
     def test_aggregate_with_alias(self) -> None:
         """Field with both aggregate and alias."""
@@ -1138,6 +1163,7 @@ class TestBuildQueryBodyAggregation:
         assert body["select"] == [
             {"fieldId": "f1", "aggregate": "avg", "alias": "Avg Duration"}
         ]
+        assert "groupBy" not in body
 
     def test_all_aggregate_types(self) -> None:
         """All supported aggregate types should pass through."""
@@ -1152,16 +1178,111 @@ class TestBuildQueryBodyAggregation:
             assert body["select"][0]["aggregate"] == agg
 
 
+class TestBuildQueryBodyGrouping:
+    """Tests for groupBy behavior in _build_query_body."""
+
+    def test_no_aggregate_no_groupby(self) -> None:
+        """Plain fields without aggregates should not have top-level groupBy."""
+        body = _build_query_body(
+            fields=[{"field_id": "f1"}, {"field_id": "f2"}],
+            filters=None,
+            order_by=None,
+            limit=100,
+            fmt="display",
+        )
+        assert body["select"][0] == {"fieldId": "f1", "aggregate": "none"}
+        assert body["select"][1] == {"fieldId": "f2", "aggregate": "none"}
+        assert "groupBy" not in body
+
+    def test_all_aggregates_no_groupby(self) -> None:
+        """All aggregated fields should not produce a top-level groupBy."""
+        body = _build_query_body(
+            fields=[
+                {"field_id": "f1", "aggregate": "count"},
+                {"field_id": "f2", "aggregate": "avg"},
+            ],
+            filters=None,
+            order_by=None,
+            limit=100,
+            fmt="display",
+        )
+        assert body["select"][0] == {"fieldId": "f1", "aggregate": "count"}
+        assert body["select"][1] == {"fieldId": "f2", "aggregate": "avg"}
+        assert "groupBy" not in body
+
+    def test_multiple_group_fields(self) -> None:
+        """Multiple non-aggregated fields should all appear in top-level groupBy."""
+        body = _build_query_body(
+            fields=[
+                {"field_id": "airport"},
+                {"field_id": "fleet"},
+                {"field_id": "flights", "aggregate": "count"},
+            ],
+            filters=None,
+            order_by=None,
+            limit=100,
+            fmt="display",
+        )
+        assert body["select"][0] == {"fieldId": "airport", "aggregate": "none"}
+        assert body["select"][1] == {"fieldId": "fleet", "aggregate": "none"}
+        assert body["select"][2] == {"fieldId": "flights", "aggregate": "count"}
+        assert body["groupBy"] == [
+            {"fieldId": "airport"},
+            {"fieldId": "fleet"},
+        ]
+
+    def test_groupby_with_alias(self) -> None:
+        """GroupBy field with alias should have alias on select, fieldId in groupBy."""
+        body = _build_query_body(
+            fields=[
+                {"field_id": "f1", "alias": "Airport Name"},
+                {"field_id": "f2", "aggregate": "count"},
+            ],
+            filters=None,
+            order_by=None,
+            limit=100,
+            fmt="display",
+        )
+        assert body["select"][0] == {
+            "fieldId": "f1", "aggregate": "none", "alias": "Airport Name",
+        }
+        assert body["groupBy"] == [{"fieldId": "f1"}]
+
+    def test_single_aggregate_single_group(self) -> None:
+        """Classic GROUP BY: one group field, one aggregate."""
+        body = _build_query_body(
+            fields=[
+                {"field_id": "takeoff_airport"},
+                {"field_id": "flight_record", "aggregate": "count"},
+            ],
+            filters=None,
+            order_by=None,
+            limit=10,
+            fmt="display",
+        )
+        assert body["select"][0] == {"fieldId": "takeoff_airport", "aggregate": "none"}
+        assert body["select"][1] == {"fieldId": "flight_record", "aggregate": "count"}
+        assert body["groupBy"] == [{"fieldId": "takeoff_airport"}]
+        assert body["top"] == 10
+
+
 class TestQueryDatabaseAggregation:
     """Tests for aggregation in the query_database tool."""
+
+    @pytest.fixture(autouse=True)
+    async def clear_cache(self) -> None:
+        """Clear caches before each test."""
+        from ems_mcp.cache import field_cache, database_cache
+        await field_cache.clear()
+        await database_cache.clear()
 
     @pytest.mark.asyncio
     async def test_invalid_aggregate_rejected(self) -> None:
         """Tool should reject invalid aggregate values."""
         result = await _query_database(
             ems_system_id=1,
-            database_id="db",
-            fields=[{"field_id": "f1", "aggregate": "median"}],
+            database_id="[db]",
+            fields=[{"field_id": "[f1]", "aggregate": "median"}],
         )
         assert "Error" in result
         assert "Invalid aggregate" in result
@@ -1178,8 +1299,8 @@ class TestQueryDatabaseAggregation:
         with patch("ems_mcp.tools.query.get_client", return_value=mock_client):
             result = await _query_database(
                 ems_system_id=1,
-                database_id="db",
-                fields=[{"field_id": "f1", "aggregate": "avg", "alias": "Avg Duration"}],
+                database_id="[db]",
+                fields=[{"field_id": "[f1]", "aggregate": "avg", "alias": "Avg Duration"}],
             )
 
         assert "3.5" in result
@@ -1373,9 +1494,10 @@ class TestQueryDatabaseDiscreteResolution:
 
     @pytest.fixture(autouse=True)
     async def clear_cache(self) -> None:
-        """Clear field cache before each test."""
-        from ems_mcp.cache import field_cache
+        """Clear caches before each test."""
+        from ems_mcp.cache import field_cache, database_cache
         await field_cache.clear()
+        await database_cache.clear()
 
     @pytest.mark.asyncio
     async def test_string_filter_auto_resolved(self) -> None:
@@ -1383,7 +1505,7 @@ class TestQueryDatabaseDiscreteResolution:
         mock_client = MagicMock()
         # get call for field metadata
         mock_client.get = AsyncMock(return_value={
-            "id": "f2", "name": "Fleet", "type": "discrete",
+            "id": "[f2]", "name": "Fleet", "type": "discrete",
             "discreteValues": [{"value": 31, "label": "DHC-8-400"}],
         })
         # post call for query
@@ -1395,9 +1517,9 @@ class TestQueryDatabaseDiscreteResolution:
         with patch("ems_mcp.tools.query.get_client", return_value=mock_client):
             result = await _query_database(
                 ems_system_id=1,
-                database_id="db",
-                fields=[{"field_id": "f1"}],
-                filters=[{"field_id": "f2", "operator": "equal", "value": "DHC-8-400"}],
+                database_id="[db]",
+                fields=[{"field_id": "[f1]"}],
+                filters=[{"field_id": "[f2]", "operator": "equal", "value": "DHC-8-400"}],
             )
 
         assert "test" in result
@@ -1411,16 +1533,16 @@ class TestQueryDatabaseDiscreteResolution:
         """Failed resolution should return helpful error message."""
         mock_client = MagicMock()
         mock_client.get = AsyncMock(return_value={
-            "id": "f2", "name": "Fleet", "type": "discrete",
+            "id": "[f2]", "name": "Fleet", "type": "discrete",
             "discreteValues": [{"value": 31, "label": "DHC-8-400"}],
         })
 
         with patch("ems_mcp.tools.query.get_client", return_value=mock_client):
             result = await _query_database(
                 ems_system_id=1,
-                database_id="db",
-                fields=[{"field_id": "f1"}],
-                filters=[{"field_id": "f2", "operator": "equal", "value": "NonexistentFleet"}],
+                database_id="[db]",
+                fields=[{"field_id": "[f1]"}],
+                filters=[{"field_id": "[f2]", "operator": "equal", "value": "NonexistentFleet"}],
             )
 
         assert "Error resolving filter value" in result
@@ -1462,3 +1584,505 @@ class TestGetFieldMetadata:
             await _get_field_metadata(1, "db", "[-hub-][field][test]")
         call_path = mock_client.get.call_args[0][0]
         assert "%5B" in call_path
+
+
+class TestExtractColumnNames:
+    """Tests for _extract_column_names helper."""
+
+    def test_basic_headers(self) -> None:
+        """Should extract names from dict headers."""
+        headers = [{"name": "Col A"}, {"name": "Col B"}]
+        fields: list[QueryField] = [{"field_id": "[f1]"}, {"field_id": "[f2]"}]
+        result = _extract_column_names(headers, fields)
+        assert result == ["Col A", "Col B"]
+
+    def test_alias_override(self) -> None:
+        """Alias should override header name."""
+        headers = [{"name": "Raw Name"}]
+        fields: list[QueryField] = [{"field_id": "[f1]", "alias": "My Name"}]
+        result = _extract_column_names(headers, fields)
+        assert result == ["My Name"]
+
+    def test_string_headers(self) -> None:
+        """Should handle plain string headers."""
+        headers = ["Name", "Value"]
+        fields: list[QueryField] = [{"field_id": "[f1]"}, {"field_id": "[f2]"}]
+        result = _extract_column_names(headers, fields)
+        assert result == ["Name", "Value"]
+
+
+class TestFormatQueryResultsCsv:
+    """Tests for _format_query_results_csv formatter."""
+
+    def test_basic_csv(self) -> None:
+        """Should produce valid CSV output."""
+        response = {
+            "header": [{"name": "Name"}, {"name": "Value"}],
+            "rows": [["Alice", 42], ["Bob", 99]],
+        }
+        fields: list[QueryField] = [{"field_id": "[f1]"}, {"field_id": "[f2]"}]
+        result = _format_query_results_csv(response, fields)
+        assert "Name,Value" in result
+        assert "Alice,42" in result
+        assert "Bob,99" in result
+        assert "2 row(s)" in result
+
+    def test_csv_null_handling(self) -> None:
+        """None values should become empty fields (not 'NULL')."""
+        response = {
+            "header": [{"name": "Col"}],
+            "rows": [[None], ["val"]],
+        }
+        fields: list[QueryField] = [{"field_id": "[f1]"}]
+        result = _format_query_results_csv(response, fields)
+        # NULL should not appear in CSV output
+        assert "NULL" not in result
+        assert "val" in result
+
+    def test_csv_empty_results(self) -> None:
+        """Empty results should show 0 rows message."""
+        result = _format_query_results_csv({"rows": [], "header": []}, [])
+        assert "0 rows" in result
+
+    def test_csv_with_alias(self) -> None:
+        """Alias should be used as header."""
+        response = {
+            "header": [{"name": "raw_name"}],
+            "rows": [["test"]],
+        }
+        fields: list[QueryField] = [{"field_id": "[f1]", "alias": "My Col"}]
+        result = _format_query_results_csv(response, fields)
+        assert "My Col" in result
+        assert "raw_name" not in result
+
+
+class TestFormatQueryResultsJson:
+    """Tests for _format_query_results_json formatter."""
+
+    def test_basic_json(self) -> None:
+        """Should produce valid compact JSON."""
+        import json
+        response = {
+            "header": [{"name": "Name"}, {"name": "Value"}],
+            "rows": [["Alice", 42], ["Bob", 99]],
+        }
+        fields: list[QueryField] = [{"field_id": "[f1]"}, {"field_id": "[f2]"}]
+        result = _format_query_results_json(response, fields)
+        parsed = json.loads(result)
+        assert parsed["columns"] == ["Name", "Value"]
+        assert parsed["row_count"] == 2
+        assert parsed["rows"][0]["Name"] == "Alice"
+        assert parsed["rows"][0]["Value"] == 42
+
+    def test_json_empty_results(self) -> None:
+        """Empty results should produce empty JSON."""
+        import json
+        result = _format_query_results_json({"rows": [], "header": []}, [])
+        parsed = json.loads(result)
+        assert parsed["row_count"] == 0
+        assert parsed["rows"] == []
+
+    def test_json_compact(self) -> None:
+        """JSON should use compact separators (no spaces)."""
+        response = {
+            "header": [{"name": "A"}],
+            "rows": [["x"]],
+        }
+        fields: list[QueryField] = [{"field_id": "[f1]"}]
+        result = _format_query_results_json(response, fields)
+        # Compact: no spaces after : or ,
+        assert ": " not in result
+        assert ", " not in result
+
+
+class TestFormatAnalyticsResultsCsv:
+    """Tests for _format_analytics_results_csv formatter."""
+
+    def test_basic_csv(self) -> None:
+        """Should produce CSV with flight comment headers."""
+        results = [{
+            "flight_id": 100,
+            "data": {
+                "offsets": [0.0, 1.0],
+                "results": [
+                    {"analyticId": "Alt", "values": [1000.0, 1100.0]},
+                ],
+            },
+        }]
+        result = _format_analytics_results_csv(results)
+        assert "# Flight 100" in result
+        assert "Offset" in result
+        assert "1000.0" in result
+
+    def test_csv_error_flight(self) -> None:
+        """Error flights should show error comment."""
+        results = [{"flight_id": 200, "error": "Not found"}]
+        result = _format_analytics_results_csv(results)
+        assert "# Flight 200" in result
+        assert "# Error: Not found" in result
+
+    def test_csv_all_zero_warning(self) -> None:
+        """All-zero data should trigger warning comment."""
+        results = [{
+            "flight_id": 100,
+            "data": {
+                "offsets": [float(i) for i in range(150)],
+                "results": [
+                    {"analyticId": "Alt", "values": [0.0] * 150},
+                ],
+            },
+        }]
+        result = _format_analytics_results_csv(results)
+        assert "# WARNING" in result
+
+    def test_csv_empty(self) -> None:
+        """Empty results should return message."""
+        result = _format_analytics_results_csv([])
+        assert "No analytics results" in result
+
+
+class TestFormatAnalyticsResultsJson:
+    """Tests for _format_analytics_results_json formatter."""
+
+    def test_basic_json(self) -> None:
+        """Should produce valid JSON with flights array."""
+        import json
+        results = [{
+            "flight_id": 100,
+            "data": {
+                "offsets": [0.0, 1.0],
+                "results": [
+                    {"analyticId": "Alt", "values": [1000.0, 1100.0]},
+                ],
+            },
+        }]
+        result = _format_analytics_results_json(results, analytic_names=["Altitude"])
+        parsed = json.loads(result)
+        assert len(parsed["flights"]) == 1
+        assert parsed["flights"][0]["flight_id"] == 100
+        assert parsed["flights"][0]["row_count"] == 2
+        assert parsed["flights"][0]["rows"][0]["Altitude"] == 1000.0
+
+    def test_json_error_flight(self) -> None:
+        """Error flights should include error field."""
+        import json
+        results = [{"flight_id": 200, "error": "Not found"}]
+        result = _format_analytics_results_json(results)
+        parsed = json.loads(result)
+        assert parsed["flights"][0]["error"] == "Not found"
+
+    def test_json_all_zero_warning(self) -> None:
+        """All-zero data should add warning."""
+        import json
+        results = [{
+            "flight_id": 100,
+            "data": {
+                "offsets": [float(i) for i in range(150)],
+                "results": [
+                    {"analyticId": "Alt", "values": [0.0] * 150},
+                ],
+            },
+        }]
+        result = _format_analytics_results_json(results)
+        parsed = json.loads(result)
+        assert len(parsed["warnings"]) > 0
+
+    def test_json_empty(self) -> None:
+        """Empty results should return empty JSON."""
+        import json
+        result = _format_analytics_results_json([])
+        parsed = json.loads(result)
+        assert parsed["flights"] == []
+        assert parsed["warnings"] == []
+
+
+class TestQueryDatabaseOutputFormat:
+    """Tests for output_format parameter in query_database."""
+
+    @pytest.fixture(autouse=True)
+    async def clear_cache(self) -> None:
+        """Clear caches before each test."""
+        from ems_mcp.cache import field_cache, database_cache
+        await field_cache.clear()
+        await database_cache.clear()
+
+    @pytest.mark.asyncio
+    async def test_csv_output(self) -> None:
+        """query_database should return CSV when output_format='csv'."""
+        mock_client = MagicMock()
+        mock_client.post = AsyncMock(return_value={
+            "header": [{"name": "Name"}],
+            "rows": [["Alice"]],
+        })
+
+        with patch("ems_mcp.tools.query.get_client", return_value=mock_client):
+            result = await _query_database(
+                ems_system_id=1,
+                database_id="[db]",
+                fields=[{"field_id": "[f1]"}],
+                output_format="csv",
+            )
+
+        assert "Name" in result
+        assert "Alice" in result
+        # CSV should not have table separators
+        assert "-+-" not in result
+
+    @pytest.mark.asyncio
+    async def test_json_output(self) -> None:
+        """query_database should return JSON when output_format='json'."""
+        import json
+        mock_client = MagicMock()
+        mock_client.post = AsyncMock(return_value={
+            "header": [{"name": "Name"}],
+            "rows": [["Alice"]],
+        })
+
+        with patch("ems_mcp.tools.query.get_client", return_value=mock_client):
+            result = await _query_database(
+                ems_system_id=1,
+                database_id="[db]",
+                fields=[{"field_id": "[f1]"}],
+                output_format="json",
+            )
+
+        parsed = json.loads(result)
+        assert parsed["row_count"] == 1
+        assert parsed["rows"][0]["Name"] == "Alice"
+
+
+class TestQueryFlightAnalyticsOutputFormat:
+    """Tests for output_format parameter in query_flight_analytics."""
+
+    @pytest.fixture(autouse=True)
+    async def clear_cache(self) -> None:
+        """Clear caches before each test."""
+        from ems_mcp.cache import field_cache
+        await field_cache.clear()
+
+    @pytest.mark.asyncio
+    async def test_csv_output(self) -> None:
+        """query_flight_analytics should return CSV when output_format='csv'."""
+        mock_client = MagicMock()
+        mock_client.post = AsyncMock(return_value={
+            "offsets": [0.0, 1.0],
+            "results": [
+                {"analyticId": "[-hub-][a1]", "values": [1000.0, 1100.0]},
+            ],
+        })
+
+        with patch("ems_mcp.tools.query.get_client", return_value=mock_client):
+            result = await _query_flight_analytics(
+                ems_system_id=1,
+                flight_ids=[100],
+                analytics=["[-hub-][a1]"],
+                output_format="csv",
+            )
+
+        assert "# Flight 100" in result
+        assert "Offset" in result
+
+    @pytest.mark.asyncio
+    async def test_json_output(self) -> None:
+        """query_flight_analytics should return JSON when output_format='json'."""
+        import json
+        mock_client = MagicMock()
+        mock_client.post = AsyncMock(return_value={
+            "offsets": [0.0],
+            "results": [
+                {"analyticId": "[-hub-][a1]", "values": [500.0]},
+            ],
+        })
+
+        with patch("ems_mcp.tools.query.get_client", return_value=mock_client):
+            result = await _query_flight_analytics(
+                ems_system_id=1,
+                flight_ids=[100],
+                analytics=["[-hub-][a1]"],
+                output_format="json",
+            )
+
+        parsed = json.loads(result)
+        assert len(parsed["flights"]) == 1
+        assert parsed["flights"][0]["flight_id"] == 100
+
+    @pytest.mark.asyncio
+    async def test_invalid_output_format(self) -> None:
+        """Tool should reject invalid output_format."""
+        result = await _query_flight_analytics(
+            ems_system_id=1,
+            flight_ids=[1],
+            analytics=["[-hub-][a1]"],
+            output_format="xml",
+        )
+        assert "Error" in result
+        assert "output_format" in result
+
+
+class TestQueryDatabaseFieldResolution:
+    """Tests for field ID resolution in query_database."""
+
+    @pytest.fixture(autouse=True)
+    async def clear_cache(self) -> None:
+        """Clear caches before each test."""
+        from ems_mcp.cache import field_cache, database_cache
+        await field_cache.clear()
+        await database_cache.clear()
+
+    @pytest.mark.asyncio
+    async def test_resolves_ref_numbers(self) -> None:
+        """Tool should resolve [N] reference numbers in field_id."""
+        from ems_mcp.tools.discovery import _reset_result_store, _store_result
+        _reset_result_store()
+        _store_result("Flight Date", "[-hub-][field][date]")
+
+        mock_client = MagicMock()
+        mock_client.post = AsyncMock(return_value={
+            "header": [{"name": "Flight Date"}],
+            "rows": [["2024-01-15"]],
+        })
+
+        with patch("ems_mcp.tools.query.get_client", return_value=mock_client):
+            result = await _query_database(
+                ems_system_id=1,
+                database_id="[db]",
+                fields=[{"field_id": 0}],
+            )
+
+        assert "2024-01-15" in result
+        # The query body should use the resolved ID
+        call_body = mock_client.post.call_args[1]["json"]
+        assert call_body["select"][0]["fieldId"] == "[-hub-][field][date]"
+
+    @pytest.mark.asyncio
+    async def test_resolves_field_names(self) -> None:
+        """Tool should resolve human-readable field names."""
+        mock_client = MagicMock()
+        # get call for field name resolution
+        mock_client.get = AsyncMock(return_value=[
+            {"id": "[-hub-][field][date]", "name": "Flight Date"},
+        ])
+        mock_client.post = AsyncMock(return_value={
+            "header": [{"name": "Flight Date"}],
+            "rows": [["2024-01-15"]],
+        })
+
+        with patch("ems_mcp.tools.query.get_client", return_value=mock_client), \
+             patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _query_database(
+                ems_system_id=1,
+                database_id="[db]",
+                fields=[{"field_id": "Flight Date"}],
+            )
+
+        assert "2024-01-15" in result
+
+    @pytest.mark.asyncio
+    async def test_resolves_database_name(self) -> None:
+        """Tool should resolve database names to IDs."""
+        mock_client = MagicMock()
+        # get calls: (1) database groups
+        mock_client.get = AsyncMock(return_value={
+            "id": "[none]", "name": "Root",
+            "databases": [
+                {"id": "[ems-core][entity-type][foqa-flights]", "name": "FDW Flights"},
+            ],
+            "groups": [],
+        })
+        mock_client.post = AsyncMock(return_value={
+            "header": [{"name": "Col"}],
+            "rows": [["test"]],
+        })
+
+        with patch("ems_mcp.tools.query.get_client", return_value=mock_client), \
+             patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _query_database(
+                ems_system_id=1,
+                database_id="FDW Flights",
+                fields=[{"field_id": "[f1]"}],
+            )
+
+        assert "test" in result
+        # The query should use the resolved database ID in the path
+        call_path = mock_client.post.call_args[0][0]
+        assert "[ems-core][entity-type][foqa-flights]" in call_path
+
+    @pytest.mark.asyncio
+    async def test_invalid_ref_number_returns_error(self) -> None:
+        """Invalid reference number should return error."""
+        from ems_mcp.tools.discovery import _reset_result_store
+        _reset_result_store()
+
+        result = await _query_database(
+            ems_system_id=1,
+            database_id="[db]",
+            fields=[{"field_id": 999}],
+        )
+        assert "Error resolving field" in result
+
+    @pytest.mark.asyncio
+    async def test_analytic_ref_rejected(self) -> None:
+        """Analytic references should be rejected with helpful error."""
+        from ems_mcp.tools.discovery import _reset_result_store, _store_result
+        _reset_result_store()
+        _store_result("Airspeed", "H4sIAAAA...", result_type="analytic")
+
+        result = await _query_database(
+            ems_system_id=1,
+            database_id="[db]",
+            fields=[{"field_id": 0}],
+        )
+        assert "Error resolving field" in result
+        assert "analytic parameter" in result
+
+    @pytest.mark.asyncio
+    async def test_entity_type_db_field_name_resolution(self) -> None:
+        """Field names on entity-type databases should use BFS fallback."""
+        mock_client = MagicMock()
+        # BFS field-groups response
+        mock_client.get = AsyncMock(return_value={
+            "id": "[none]", "name": "Root",
+            "fields": [
+                {"id": "[-hub-][field][flight-record]", "name": "Flight Record", "type": "number"},
+            ],
+            "groups": [],
+        })
+        mock_client.post = AsyncMock(return_value={
+            "header": [{"name": "Flight Record"}],
+            "rows": [[12345]],
+        })
+
+        entity_db = "[ems-core][entity-type][foqa-flights]"
+        with patch("ems_mcp.tools.query.get_client", return_value=mock_client), \
+             patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _query_database(
+                ems_system_id=1,
+                database_id=entity_db,
+                fields=[{"field_id": "Flight Record"}],
+            )
+
+        assert "12345" in result
+        # Should have used field-groups (BFS), not /fields?text= search
+        get_calls = [c[0][0] for c in mock_client.get.call_args_list]
+        assert any("field-groups" in p for p in get_calls)
+        assert not any("/fields?" in p for p in get_calls)
+
+    @pytest.mark.asyncio
+    async def test_ems_api_error_in_field_resolution(self) -> None:
+        """EMSAPIError during field resolution should return error message."""
+        from ems_mcp.api.client import EMSAPIError
+
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(
+            side_effect=EMSAPIError("Method Not Allowed", status_code=405)
+        )
+
+        with patch("ems_mcp.tools.query.get_client", return_value=mock_client), \
+             patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _query_database(
+                ems_system_id=1,
+                database_id="[db]",
+                fields=[{"field_id": "Some Field"}],
+            )
+
+        assert "Error resolving field" in result

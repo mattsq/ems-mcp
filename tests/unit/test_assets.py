@@ -9,18 +9,12 @@ from ems_mcp.tools.assets import (
     _format_airports,
     _format_flight_phases,
     _format_fleets,
-    list_aircraft,
-    list_airports,
-    list_flight_phases,
-    list_fleets,
+    get_assets,
     ping_system,
 )
 
 # Access the underlying functions from the FastMCP FunctionTool wrappers
-_list_fleets = list_fleets.fn
-_list_aircraft = list_aircraft.fn
-_list_flight_phases = list_flight_phases.fn
-_list_airports = list_airports.fn
+_get_assets = get_assets.fn
 _ping_system = ping_system.fn
 
 
@@ -102,27 +96,29 @@ class TestAssetFormatters:
         assert "[" not in result.split("\n")[-1]
 
 
-class TestAssetTools:
-    """Tests for asset tools."""
+class TestGetAssets:
+    """Tests for get_assets consolidated tool."""
 
     @pytest.mark.asyncio
-    async def test_list_fleets_success(self) -> None:
+    async def test_get_fleets(self) -> None:
         mock_client = MagicMock()
         mock_client.get = AsyncMock(return_value=[{"id": 1, "name": "Fleet 1"}])
 
         with patch("ems_mcp.tools.assets.get_client", return_value=mock_client):
-            result = await _list_fleets(ems_system_id=1)
+            result = await _get_assets(ems_system_id=1, asset_type="fleets")
 
         assert "Fleet 1" in result
         mock_client.get.assert_called_once_with("/api/v2/ems-systems/1/assets/fleets")
 
     @pytest.mark.asyncio
-    async def test_list_aircraft_success(self) -> None:
+    async def test_get_aircraft_with_fleet_filter(self) -> None:
         mock_client = MagicMock()
         mock_client.get = AsyncMock(return_value=[{"id": 1, "name": "AC1", "fleetName": "F1"}])
 
         with patch("ems_mcp.tools.assets.get_client", return_value=mock_client):
-            result = await _list_aircraft(ems_system_id=1, fleet_id=10)
+            result = await _get_assets(
+                ems_system_id=1, asset_type="aircraft", fleet_id=10
+            )
 
         assert "AC1" in result
         mock_client.get.assert_called_once_with(
@@ -130,12 +126,12 @@ class TestAssetTools:
         )
 
     @pytest.mark.asyncio
-    async def test_list_aircraft_no_fleet_filter(self) -> None:
+    async def test_get_aircraft_no_fleet_filter(self) -> None:
         mock_client = MagicMock()
         mock_client.get = AsyncMock(return_value=[{"id": 1, "name": "AC1", "fleetName": "F1"}])
 
         with patch("ems_mcp.tools.assets.get_client", return_value=mock_client):
-            result = await _list_aircraft(ems_system_id=1)
+            result = await _get_assets(ems_system_id=1, asset_type="aircraft")
 
         assert "AC1" in result
         mock_client.get.assert_called_once_with(
@@ -143,28 +139,58 @@ class TestAssetTools:
         )
 
     @pytest.mark.asyncio
-    async def test_list_flight_phases_success(self) -> None:
+    async def test_get_flight_phases(self) -> None:
         mock_client = MagicMock()
         mock_client.get = AsyncMock(return_value=[{"id": 1, "name": "Phase 1"}])
 
         with patch("ems_mcp.tools.assets.get_client", return_value=mock_client):
-            result = await _list_flight_phases(ems_system_id=1)
+            result = await _get_assets(ems_system_id=1, asset_type="flight_phases")
 
         assert "Phase 1" in result
         mock_client.get.assert_called_once_with("/api/v2/ems-systems/1/assets/flight-phases")
 
     @pytest.mark.asyncio
-    async def test_list_airports_success(self) -> None:
+    async def test_get_airports(self) -> None:
         mock_client = MagicMock()
         mock_client.get = AsyncMock(return_value=[{"id": 1, "codeIcao": "YSSY"}])
 
         with patch("ems_mcp.tools.assets.get_client", return_value=mock_client):
-            result = await _list_airports(ems_system_id=1)
+            result = await _get_assets(ems_system_id=1, asset_type="airports")
 
         assert "YSSY" in result
         mock_client.get.assert_called_once_with(
             "/api/v2/ems-systems/1/assets/airports"
         )
+
+    @pytest.mark.asyncio
+    async def test_not_found_error(self) -> None:
+        from ems_mcp.api.client import EMSNotFoundError
+
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(side_effect=EMSNotFoundError("Not found"))
+
+        with patch("ems_mcp.tools.assets.get_client", return_value=mock_client):
+            result = await _get_assets(ems_system_id=999, asset_type="fleets")
+
+        assert "Error" in result
+        assert "not found" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_api_error(self) -> None:
+        from ems_mcp.api.client import EMSAPIError
+
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(side_effect=EMSAPIError("Server error"))
+
+        with patch("ems_mcp.tools.assets.get_client", return_value=mock_client):
+            result = await _get_assets(ems_system_id=1, asset_type="airports")
+
+        assert "Error" in result
+        assert "Server error" in result
+
+
+class TestPingSystem:
+    """Tests for ping_system tool."""
 
     @pytest.mark.asyncio
     async def test_ping_system_bool_true(self) -> None:
