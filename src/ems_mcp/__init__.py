@@ -24,15 +24,15 @@ from ems_mcp.api.client import (
 from ems_mcp.config import EMSSettings, get_settings
 from ems_mcp.server import get_client, mcp, run
 from ems_mcp.tools import (
+    find_fields,
+    get_assets,
     get_field_info,
     list_databases,
     list_ems_systems,
-    list_fields,
     search_analytics,
-    search_fields,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     # Server
@@ -56,8 +56,9 @@ __all__ = [
     # Discovery Tools
     "list_ems_systems",
     "list_databases",
-    "list_fields",
-    "search_fields",
+    "find_fields",
     "get_field_info",
     "search_analytics",
+    # Asset Tools
+    "get_assets",
 ]

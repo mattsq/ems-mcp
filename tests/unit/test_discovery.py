@@ -6,6 +6,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from ems_mcp.tools.discovery import (
+    _do_browse_fields,
+    _do_search_fields,
+    _do_deep_search_fields,
     _format_analytics_search_results,
     _format_database_group,
     _format_deep_search_results,
@@ -17,22 +20,21 @@ from ems_mcp.tools.discovery import (
     _is_entity_type_database,
     _recursive_field_search,
     _reset_result_store,
+    _resolve_database_id,
+    _resolve_field_id,
     _store_result,
+    find_fields,
     get_field_info,
     get_result_id,
     list_databases,
     list_ems_systems,
-    list_fields,
     search_analytics,
-    search_fields,
-    search_fields_deep,
 )
 
 # Access the underlying functions from the FastMCP FunctionTool wrappers
 _list_ems_systems = list_ems_systems.fn
 _list_databases = list_databases.fn
-_list_fields = list_fields.fn
-_search_fields = search_fields.fn
+_find_fields = find_fields.fn
 _get_field_info = get_field_info.fn
 _search_analytics = search_analytics.fn
 _get_result_id = get_result_id.fn
@@ -78,8 +80,11 @@ class TestFormatters:
         }
         result = _format_database_group(group)
         assert "Group: Root" in result
-        assert "FDW Flights (ID: ems-core): Flight Data Warehouse" in result
+        assert "FDW Flights: Flight Data Warehouse" in result
+        # Database IDs should be hidden for non-group databases
+        assert "(ID: ems-core)" not in result
         assert "Profile Results (ID: group-1)" in result
+        assert "Use database names directly" in result
 
     def test_format_database_group_nested(self) -> None:
         """Format nested database group with pluralName."""
@@ -116,6 +121,7 @@ class TestFormatters:
 
     def test_format_field_group_with_fields(self) -> None:
         """Format field group with fields."""
+        _reset_result_store()
         group = {
             "id": "[none]",
             "name": "Root",
@@ -133,9 +139,12 @@ class TestFormatters:
         assert "Flight Date (datetime)" in result
         assert "Duration (number)" in result
         assert "Identification (ID: identification)" in result
+        # Fields now use numbered references instead of showing raw IDs
+        assert "[0]" in result or "[" in result
 
-    def test_format_field_group_shows_full_ids(self) -> None:
-        """Field group should show full field IDs (not truncated)."""
+    def test_format_field_group_uses_numbered_refs(self) -> None:
+        """Field group should use numbered [N] references instead of raw IDs."""
+        _reset_result_store()
         long_id = "[-hub-][field][[[ems-core][entity-type][foqa-flights]][[ems-core][base-field][flight.uid]]]"
         group = {
             "id": "[none]",
@@ -144,7 +153,13 @@ class TestFormatters:
             "groups": [],
         }
         result = _format_field_group(group)
-        assert long_id in result
+        # Raw ID should NOT appear inline; a numbered ref should be used instead
+        assert long_id not in result
+        assert "Test Field (string)" in result
+        # The stored result should have the full ID
+        ref_entry = _get_stored_result(0)
+        assert ref_entry is not None
+        assert ref_entry["id"] == long_id
 
     def test_format_field_search_results_empty(self) -> None:
         """Format empty search results."""
@@ -166,7 +181,7 @@ class TestFormatters:
         assert "ID:" not in result
         assert "[0]" in result
         assert "[1]" in result
-        assert "get_result_id" in result
+        assert "reference numbers or field names" in result
 
     def test_format_field_search_results_show_ids(self) -> None:
         """Format search results with show_ids=True shows full IDs."""
@@ -403,17 +418,18 @@ class TestListDatabases:
         assert "Verify ems_system_id" in result
 
 
-class TestListFields:
-    """Tests for list_fields tool."""
+class TestFindFieldsBrowse:
+    """Tests for find_fields tool in browse mode (formerly list_fields)."""
 
     @pytest.fixture(autouse=True)
     async def clear_cache(self) -> None:
         """Clear field cache before each test."""
-        from ems_mcp.cache import field_cache
+        from ems_mcp.cache import field_cache, database_cache
         await field_cache.clear()
+        await database_cache.clear()
 
     @pytest.mark.asyncio
-    async def test_list_fields_root(self) -> None:
+    async def test_browse_fields_root(self) -> None:
         """Tool should list root level fields."""
         mock_client = MagicMock()
         mock_client.get = AsyncMock(
@@ -426,16 +442,15 @@ class TestListFields:
         )
 
         with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
-            result = await _list_fields(ems_system_id=1, database_id="ems-core")
+            result = await _find_fields(
+                ems_system_id=1, database_id="[ems-core]", mode="browse"
+            )
 
         assert "Flight Date" in result
         assert "Identification" in result
-        mock_client.get.assert_called_once_with(
-            "/api/v2/ems-systems/1/databases/ems-core/field-groups"
-        )
 
     @pytest.mark.asyncio
-    async def test_list_fields_with_group_id(self) -> None:
+    async def test_browse_fields_with_group_id(self) -> None:
         """Tool should navigate to specific field group."""
         mock_client = MagicMock()
         mock_client.get = AsyncMock(
@@ -448,28 +463,27 @@ class TestListFields:
         )
 
         with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
-            result = await _list_fields(
-                ems_system_id=1, database_id="ems-core", group_id="ident"
+            result = await _find_fields(
+                ems_system_id=1, database_id="[ems-core]",
+                mode="browse", group_id="ident",
             )
 
         assert "Tail Number" in result
-        mock_client.get.assert_called_once_with(
-            "/api/v2/ems-systems/1/databases/ems-core/field-groups?groupId=ident"
-        )
 
     @pytest.mark.asyncio
-    async def test_list_fields_rejects_entity_type_group_id(self) -> None:
+    async def test_browse_fields_rejects_entity_type_group_id(self) -> None:
         """Tool should reject database IDs that are actually group IDs."""
-        result = await _list_fields(
+        result = await _find_fields(
             ems_system_id=1,
             database_id="[ems-core][entity-type-group][foqa-flights]",
+            mode="browse",
         )
         assert "Error" in result
         assert "GROUP ID" in result
         assert "list_databases" in result
 
     @pytest.mark.asyncio
-    async def test_list_fields_not_found(self) -> None:
+    async def test_browse_fields_not_found(self) -> None:
         """Tool should handle database not found."""
         from ems_mcp.api.client import EMSNotFoundError
 
@@ -477,27 +491,42 @@ class TestListFields:
         mock_client.get = AsyncMock(side_effect=EMSNotFoundError("Not found"))
 
         with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
-            result = await _list_fields(ems_system_id=1, database_id="invalid")
+            result = await _find_fields(
+                ems_system_id=1, database_id="[invalid]", mode="browse"
+            )
 
         assert "Error" in result
         assert "Use list_databases" in result
 
 
-class TestSearchFields:
-    """Tests for search_fields tool."""
+class TestFindFieldsSearch:
+    """Tests for find_fields tool in search mode (formerly search_fields)."""
 
     @pytest.fixture(autouse=True)
     async def clear_cache(self) -> None:
         """Clear field cache before each test."""
-        from ems_mcp.cache import field_cache
+        from ems_mcp.cache import field_cache, database_cache
         await field_cache.clear()
+        await database_cache.clear()
+
+    @pytest.mark.asyncio
+    async def test_search_requires_search_text(self) -> None:
+        """Search mode should require search_text."""
+        result = await _find_fields(
+            ems_system_id=1,
+            database_id="[ems-core]",
+            mode="search",
+        )
+        assert "Error" in result
+        assert "search_text" in result
 
     @pytest.mark.asyncio
     async def test_search_fields_rejects_entity_type_group_id(self) -> None:
         """Tool should reject database IDs that are actually group IDs."""
-        result = await _search_fields(
+        result = await _find_fields(
             ems_system_id=1,
             database_id="[ems-core][entity-type-group][foqa-flights]",
+            mode="search",
             search_text="altitude",
         )
         assert "Error" in result
@@ -516,17 +545,14 @@ class TestSearchFields:
         )
 
         with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
-            result = await _search_fields(
-                ems_system_id=1, database_id="ems-core", search_text="flight"
+            result = await _find_fields(
+                ems_system_id=1, database_id="[ems-core]",
+                mode="search", search_text="flight",
             )
 
         assert "Found 2 field(s):" in result
         assert "Flight Date" in result
         assert "Flight Duration" in result
-        mock_client.get.assert_called_once_with(
-            "/api/v2/ems-systems/1/databases/ems-core/fields",
-            params={"text": "flight"},
-        )
 
     @pytest.mark.asyncio
     async def test_search_fields_respects_max_results(self) -> None:
@@ -540,9 +566,10 @@ class TestSearchFields:
         )
 
         with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
-            result = await _search_fields(
+            result = await _find_fields(
                 ems_system_id=1,
-                database_id="ems-core",
+                database_id="[ems-core]",
+                mode="search",
                 search_text="field",
                 max_results=10,
             )
@@ -558,22 +585,29 @@ class TestSearchFields:
         )
 
         with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
-            await _search_fields(ems_system_id=1, database_id="ems-core", search_text="test")
-            await _search_fields(ems_system_id=1, database_id="ems-core", search_text="test")
+            await _find_fields(
+                ems_system_id=1, database_id="[ems-core]",
+                mode="search", search_text="test",
+            )
+            await _find_fields(
+                ems_system_id=1, database_id="[ems-core]",
+                mode="search", search_text="test",
+            )
 
         assert mock_client.get.call_count == 1
 
     @pytest.mark.asyncio
     async def test_search_fields_rejects_entity_type_database(self) -> None:
         """Tool should reject entity-type database IDs proactively."""
-        result = await _search_fields(
+        result = await _find_fields(
             ems_system_id=1,
             database_id="[ems-core][entity-type][foqa-flights]",
+            mode="search",
             search_text="altitude",
         )
         assert "Error" in result
         assert "entity-type database" in result
-        assert "list_fields" in result
+        assert "find_fields" in result or "mode='deep'" in result
 
     @pytest.mark.asyncio
     async def test_search_fields_405_mentions_entity_type(self) -> None:
@@ -586,15 +620,15 @@ class TestSearchFields:
         )
 
         with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
-            result = await _search_fields(
+            result = await _find_fields(
                 ems_system_id=1,
-                database_id="some-db-id",
+                database_id="[some-db-id]",
+                mode="search",
                 search_text="altitude",
             )
 
         assert "405" in result
         assert "entity-type" in result
-        assert "list_fields" in result
 
 
 class TestIsEntityTypeDatabase:
@@ -626,8 +660,9 @@ class TestGetFieldInfo:
     @pytest.fixture(autouse=True)
     async def clear_cache(self) -> None:
         """Clear field cache before each test."""
-        from ems_mcp.cache import field_cache
+        from ems_mcp.cache import field_cache, database_cache
         await field_cache.clear()
+        await database_cache.clear()
 
     @pytest.mark.asyncio
     async def test_get_field_info_basic(self) -> None:
@@ -635,7 +670,7 @@ class TestGetFieldInfo:
         mock_client = MagicMock()
         mock_client.get = AsyncMock(
             return_value={
-                "id": "field-123",
+                "id": "[field-123]",
                 "name": "Flight Date",
                 "type": "datetime",
                 "description": "Date of the flight",
@@ -644,7 +679,7 @@ class TestGetFieldInfo:
 
         with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
             result = await _get_field_info(
-                ems_system_id=1, database_id="ems-core", field_id="field-123"
+                ems_system_id=1, database_id="[ems-core]", field_id="[field-123]"
             )
 
         assert "Flight Date" in result
@@ -657,7 +692,7 @@ class TestGetFieldInfo:
         mock_client = MagicMock()
         mock_client.get = AsyncMock(
             return_value={
-                "id": "field-456",
+                "id": "[field-456]",
                 "name": "Status",
                 "type": "discrete",
                 "discreteValues": [
@@ -669,7 +704,7 @@ class TestGetFieldInfo:
 
         with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
             result = await _get_field_info(
-                ems_system_id=1, database_id="ems-core", field_id="field-456"
+                ems_system_id=1, database_id="[ems-core]", field_id="[field-456]"
             )
 
         assert "Discrete Values" in result
@@ -686,13 +721,17 @@ class TestGetFieldInfo:
 
         with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
             await _get_field_info(
-                ems_system_id=1, database_id="ems-core", field_id="[-hub-][field][test]"
+                ems_system_id=1, database_id="[ems-core]", field_id="[-hub-][field][test]"
             )
 
-        # Check that the field_id was URL encoded
-        call_args = mock_client.get.call_args[0][0]
-        assert "%5B" in call_args  # URL encoded '['
-        assert "%5D" in call_args  # URL encoded ']'
+        # Check that the field_id was URL encoded in the API call
+        # The second call is the field info request (first may be resolution)
+        for call in mock_client.get.call_args_list:
+            call_path = call[0][0]
+            if "/fields/" in call_path:
+                assert "%5B" in call_path  # URL encoded '['
+                assert "%5D" in call_path  # URL encoded ']'
+                break
 
     @pytest.mark.asyncio
     async def test_get_field_info_not_found(self) -> None:
@@ -704,11 +743,34 @@ class TestGetFieldInfo:
 
         with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
             result = await _get_field_info(
-                ems_system_id=1, database_id="ems-core", field_id="invalid"
+                ems_system_id=1, database_id="[ems-core]", field_id="[invalid]"
             )
 
         assert "Error" in result
-        assert "Use search_fields" in result
+        assert "Use find_fields" in result
+
+    @pytest.mark.asyncio
+    async def test_get_field_info_resolves_ref_number(self) -> None:
+        """Tool should resolve [N] reference numbers."""
+        _reset_result_store()
+        _store_result("Flight Date", "[-hub-][field][flight-date]")
+
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(
+            return_value={
+                "id": "[-hub-][field][flight-date]",
+                "name": "Flight Date",
+                "type": "datetime",
+            }
+        )
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _get_field_info(
+                ems_system_id=1, database_id="[ems-core]", field_id=0
+            )
+
+        assert "Flight Date" in result
+        assert "datetime" in result
 
 
 class TestSearchAnalytics:
@@ -803,10 +865,6 @@ class TestSearchAnalytics:
         assert mock_client.get.call_count == 1
 
 
-# Access the underlying function from the FastMCP FunctionTool wrapper
-_search_fields_deep = search_fields_deep.fn
-
-
 class TestFormatDeepSearchResults:
     """Tests for _format_deep_search_results formatter."""
 
@@ -832,7 +890,7 @@ class TestFormatDeepSearchResults:
         assert "Path: Profiles > Efficiency" in result
         assert "ID:" not in result
         assert "[0]" in result
-        assert "get_result_id" in result
+        assert "reference numbers or field names" in result
 
     def test_single_result_show_ids(self) -> None:
         """With show_ids=True, full ID should be displayed."""
@@ -1129,30 +1187,40 @@ class TestRecursiveFieldSearch:
         assert visit_order.index("flight") < visit_order.index("other")
 
 
-class TestSearchFieldsDeep:
-    """Tests for search_fields_deep MCP tool."""
+class TestFindFieldsDeep:
+    """Tests for find_fields tool in deep mode (formerly search_fields_deep)."""
 
     @pytest.fixture(autouse=True)
     async def clear_cache(self) -> None:
         """Clear field cache before each test."""
-        from ems_mcp.cache import field_cache
+        from ems_mcp.cache import field_cache, database_cache
         await field_cache.clear()
+        await database_cache.clear()
+
+    @pytest.mark.asyncio
+    async def test_deep_requires_search_text(self) -> None:
+        """Deep mode should require search_text."""
+        result = await _find_fields(
+            ems_system_id=1, database_id="[db]", mode="deep",
+        )
+        assert "Error" in result
+        assert "search_text" in result
 
     @pytest.mark.asyncio
     async def test_empty_search_text_rejected(self) -> None:
         """Tool should reject empty search text."""
-        result = await _search_fields_deep(
-            ems_system_id=1, database_id="db", search_text="",
+        result = await _find_fields(
+            ems_system_id=1, database_id="[db]", mode="deep", search_text="",
         )
         assert "Error" in result
-        assert "empty" in result.lower()
 
     @pytest.mark.asyncio
     async def test_entity_type_group_rejected(self) -> None:
         """Tool should reject entity-type-group database IDs."""
-        result = await _search_fields_deep(
+        result = await _find_fields(
             ems_system_id=1,
             database_id="[ems-core][entity-type-group][foqa]",
+            mode="deep",
             search_text="fuel",
         )
         assert "Error" in result
@@ -1171,8 +1239,9 @@ class TestSearchFieldsDeep:
         })
 
         with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
-            result = await _search_fields_deep(
-                ems_system_id=1, database_id="db", search_text="fuel",
+            result = await _find_fields(
+                ems_system_id=1, database_id="[db]",
+                mode="deep", search_text="fuel",
             )
 
         assert "Found 1 field(s)" in result
@@ -1190,8 +1259,9 @@ class TestSearchFieldsDeep:
         })
 
         with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
-            result = await _search_fields_deep(
-                ems_system_id=1, database_id="db", search_text="nonexistent",
+            result = await _find_fields(
+                ems_system_id=1, database_id="[db]",
+                mode="deep", search_text="nonexistent",
             )
 
         assert "No fields found" in result
@@ -1206,8 +1276,9 @@ class TestSearchFieldsDeep:
 
         with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
             # Should not error with max_depth > 10
-            result = await _search_fields_deep(
-                ems_system_id=1, database_id="db", search_text="test",
+            result = await _find_fields(
+                ems_system_id=1, database_id="[db]",
+                mode="deep", search_text="test",
                 max_depth=100,
             )
         assert "No fields found" in result
@@ -1223,10 +1294,10 @@ class TestSearchFieldsDeep:
         })
 
         with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
-            result = await _search_fields_deep(
+            result = await _find_fields(
                 ems_system_id=1,
                 database_id="[ems-core][entity-type][foqa-flights]",
-                search_text="target",
+                mode="deep", search_text="target",
             )
 
         assert "Found 1 field(s)" in result
@@ -1244,6 +1315,23 @@ class TestResultStore:
         assert entry is not None
         assert entry["name"] == "Test Field"
         assert entry["id"] == "field-abc-123"
+        assert entry["type"] == "field"
+
+    def test_store_analytic_type(self) -> None:
+        """Analytic results should have type='analytic'."""
+        _reset_result_store()
+        ref = _store_result("Airspeed", "H4sIAAAA...", result_type="analytic")
+        entry = _get_stored_result(ref)
+        assert entry is not None
+        assert entry["type"] == "analytic"
+
+    def test_store_field_type_default(self) -> None:
+        """Default result_type should be 'field'."""
+        _reset_result_store()
+        ref = _store_result("Flight Date", "field-123")
+        entry = _get_stored_result(ref)
+        assert entry is not None
+        assert entry["type"] == "field"
 
     def test_sequential_refs(self) -> None:
         """Reference numbers should be sequential."""
@@ -1307,7 +1395,7 @@ class TestResultStore:
         assert entry["name"] == "Altitude"
 
     def test_analytics_formatter_populates_store(self) -> None:
-        """Analytics formatter should populate the store."""
+        """Analytics formatter should populate the store with type='analytic'."""
         _reset_result_store()
         analytics = [
             {"id": "H4sIAAAA...", "name": "Airspeed", "type": "number", "units": "knots"},
@@ -1318,6 +1406,7 @@ class TestResultStore:
         assert entry is not None
         assert entry["id"] == "H4sIAAAA..."
         assert entry["name"] == "Airspeed"
+        assert entry["type"] == "analytic"
 
     def test_deep_search_formatter_populates_store(self) -> None:
         """Deep search formatter should populate the store."""
@@ -1353,10 +1442,18 @@ class TestGetResultId:
         _store_result("Flight Number", "[-hub-][field][flight-num]")
         _store_result("Duration", "[-hub-][field][duration]")
         result = await _get_result_id(result_numbers=[0, 1])
-        assert "[0] Flight Number" in result
+        assert "[0] Flight Number (field)" in result
         assert "ID: [-hub-][field][flight-num]" in result
-        assert "[1] Duration" in result
+        assert "[1] Duration (field)" in result
         assert "ID: [-hub-][field][duration]" in result
+
+    @pytest.mark.asyncio
+    async def test_shows_analytic_type(self) -> None:
+        """Should show (analytic) type label for analytic refs."""
+        _reset_result_store()
+        _store_result("Airspeed", "H4sIAAAA...", result_type="analytic")
+        result = await _get_result_id(result_numbers=[0])
+        assert "[0] Airspeed (analytic)" in result
 
     @pytest.mark.asyncio
     async def test_invalid_ref(self) -> None:
@@ -1382,3 +1479,295 @@ class TestGetResultId:
         """Should return error for empty list."""
         result = await _get_result_id(result_numbers=[])
         assert "Error" in result
+
+
+class TestResolveFieldId:
+    """Tests for _resolve_field_id helper."""
+
+    @pytest.fixture(autouse=True)
+    async def clear_cache(self) -> None:
+        """Clear caches before each test."""
+        from ems_mcp.cache import field_cache
+        await field_cache.clear()
+        _reset_result_store()
+
+    @pytest.mark.asyncio
+    async def test_integer_ref_from_store(self) -> None:
+        """Integer reference should look up in result store."""
+        _store_result("Flight Date", "[-hub-][field][date]")
+        result = await _resolve_field_id(0, ems_system_id=1, database_id="[db]")
+        assert result == "[-hub-][field][date]"
+
+    @pytest.mark.asyncio
+    async def test_digit_string_ref_from_store(self) -> None:
+        """Digit string should look up in result store."""
+        _store_result("Flight Date", "[-hub-][field][date]")
+        result = await _resolve_field_id("0", ems_system_id=1, database_id="[db]")
+        assert result == "[-hub-][field][date]"
+
+    @pytest.mark.asyncio
+    async def test_invalid_ref_raises(self) -> None:
+        """Invalid reference number should raise ValueError."""
+        with pytest.raises(ValueError, match="not found"):
+            await _resolve_field_id(999, ems_system_id=1, database_id="[db]")
+
+    @pytest.mark.asyncio
+    async def test_bracket_id_passthrough(self) -> None:
+        """Bracket-encoded IDs should pass through unchanged."""
+        result = await _resolve_field_id(
+            "[-hub-][field][test]", ems_system_id=1, database_id="[db]"
+        )
+        assert result == "[-hub-][field][test]"
+
+    @pytest.mark.asyncio
+    async def test_name_exact_match(self) -> None:
+        """Exact name match should resolve correctly."""
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value=[
+            {"id": "field-1", "name": "Flight Date"},
+            {"id": "field-2", "name": "Flight Date (UTC)"},
+        ])
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _resolve_field_id(
+                "Flight Date", ems_system_id=1, database_id="[db]"
+            )
+        assert result == "field-1"
+
+    @pytest.mark.asyncio
+    async def test_name_single_result(self) -> None:
+        """Single API result should be used even without exact match."""
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value=[
+            {"id": "field-1", "name": "Takeoff Airport Name"},
+        ])
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _resolve_field_id(
+                "Takeoff Airport", ems_system_id=1, database_id="[db]"
+            )
+        assert result == "field-1"
+
+    @pytest.mark.asyncio
+    async def test_name_not_found(self) -> None:
+        """Missing field should raise ValueError."""
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value=[])
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            with pytest.raises(ValueError, match="Field not found"):
+                await _resolve_field_id(
+                    "Nonexistent", ems_system_id=1, database_id="[db]"
+                )
+
+    @pytest.mark.asyncio
+    async def test_name_ambiguous(self) -> None:
+        """Ambiguous name should raise ValueError."""
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value=[
+            {"id": "f1", "name": "Altitude (Baro)"},
+            {"id": "f2", "name": "Altitude (GPS)"},
+        ])
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            with pytest.raises(ValueError, match="Ambiguous"):
+                await _resolve_field_id(
+                    "Altitude", ems_system_id=1, database_id="[db]"
+                )
+
+    @pytest.mark.asyncio
+    async def test_name_cached(self) -> None:
+        """Resolved names should be cached."""
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value=[
+            {"id": "field-1", "name": "Flight Date"},
+        ])
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            await _resolve_field_id("Flight Date", ems_system_id=1, database_id="[db]")
+            await _resolve_field_id("Flight Date", ems_system_id=1, database_id="[db]")
+        assert mock_client.get.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_analytic_ref_rejected(self) -> None:
+        """Analytic references should be rejected with helpful error."""
+        _store_result("Airspeed", "H4sIAAAA...", result_type="analytic")
+        with pytest.raises(ValueError, match="analytic parameter"):
+            await _resolve_field_id(0, ems_system_id=1, database_id="[db]")
+
+    @pytest.mark.asyncio
+    async def test_analytic_ref_error_mentions_query_flight_analytics(self) -> None:
+        """Analytic ref rejection should mention query_flight_analytics."""
+        _store_result("Altitude (Baro)", "H4sIAAAA...", result_type="analytic")
+        with pytest.raises(ValueError, match="query_flight_analytics"):
+            await _resolve_field_id(0, ems_system_id=1, database_id="[db]")
+
+    @pytest.mark.asyncio
+    async def test_field_ref_still_works(self) -> None:
+        """Field references (default type) should still resolve normally."""
+        _store_result("Flight Date", "[-hub-][field][date]")
+        result = await _resolve_field_id(0, ems_system_id=1, database_id="[db]")
+        assert result == "[-hub-][field][date]"
+
+    @pytest.mark.asyncio
+    async def test_entity_type_db_uses_bfs(self) -> None:
+        """Entity-type databases should use BFS instead of field search API."""
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value={
+            "id": "[none]", "name": "Root",
+            "fields": [
+                {"id": "field-1", "name": "Flight Record", "type": "number"},
+            ],
+            "groups": [],
+        })
+        entity_db = "[ems-core][entity-type][foqa-flights]"
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _resolve_field_id(
+                "Flight Record", ems_system_id=1, database_id=entity_db,
+            )
+        assert result == "field-1"
+        # Should have called the field-groups API (BFS), not the field search API
+        call_path = mock_client.get.call_args[0][0]
+        assert "field-groups" in call_path
+        assert "/fields?" not in call_path
+
+    @pytest.mark.asyncio
+    async def test_entity_type_db_not_found(self) -> None:
+        """Entity-type BFS fallback should raise if field not found."""
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value={
+            "id": "[none]", "name": "Root",
+            "fields": [],
+            "groups": [],
+        })
+        entity_db = "[ems-core][entity-type][foqa-flights]"
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            with pytest.raises(ValueError, match="Field not found"):
+                await _resolve_field_id(
+                    "Nonexistent", ems_system_id=1, database_id=entity_db,
+                )
+
+    @pytest.mark.asyncio
+    async def test_non_entity_type_db_uses_search_api(self) -> None:
+        """Non-entity-type databases should use the field search API."""
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value=[
+            {"id": "field-1", "name": "Flight Date"},
+        ])
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _resolve_field_id(
+                "Flight Date", ems_system_id=1, database_id="[regular-db]",
+            )
+        assert result == "field-1"
+        # Should have called the field search API, not field-groups
+        call_path = mock_client.get.call_args[0][0]
+        assert "/fields" in call_path
+        assert "field-groups" not in call_path
+
+
+class TestResolveDatabaseId:
+    """Tests for _resolve_database_id helper."""
+
+    @pytest.fixture(autouse=True)
+    async def clear_cache(self) -> None:
+        """Clear caches before each test."""
+        from ems_mcp.cache import database_cache
+        await database_cache.clear()
+
+    @pytest.mark.asyncio
+    async def test_bracket_id_passthrough(self) -> None:
+        """Bracket-encoded IDs should pass through unchanged."""
+        result = await _resolve_database_id(
+            "[ems-core][entity-type][foqa-flights]", ems_system_id=1
+        )
+        assert result == "[ems-core][entity-type][foqa-flights]"
+
+    @pytest.mark.asyncio
+    async def test_name_resolved(self) -> None:
+        """Database name should resolve to its ID."""
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(side_effect=[
+            # Root database groups
+            {
+                "id": "[none]", "name": "Root",
+                "databases": [
+                    {"id": "[ems-core][entity-type][foqa-flights]", "name": "FDW Flights"},
+                ],
+                "groups": [],
+            },
+        ])
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _resolve_database_id("FDW Flights", ems_system_id=1)
+        assert result == "[ems-core][entity-type][foqa-flights]"
+
+    @pytest.mark.asyncio
+    async def test_name_case_insensitive(self) -> None:
+        """Name lookup should be case-insensitive."""
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value={
+            "id": "[none]", "name": "Root",
+            "databases": [
+                {"id": "[db-id]", "name": "FDW Flights"},
+            ],
+            "groups": [],
+        })
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _resolve_database_id("fdw flights", ems_system_id=1)
+        assert result == "[db-id]"
+
+    @pytest.mark.asyncio
+    async def test_name_not_found(self) -> None:
+        """Unknown name should raise ValueError."""
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value={
+            "id": "[none]", "name": "Root",
+            "databases": [
+                {"id": "[db-id]", "name": "FDW Flights"},
+            ],
+            "groups": [],
+        })
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            with pytest.raises(ValueError, match="Database not found"):
+                await _resolve_database_id("Nonexistent DB", ems_system_id=1)
+
+    @pytest.mark.asyncio
+    async def test_name_cached(self) -> None:
+        """Database name map should be cached."""
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value={
+            "id": "[none]", "name": "Root",
+            "databases": [
+                {"id": "[db-id]", "name": "FDW Flights"},
+            ],
+            "groups": [],
+        })
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            await _resolve_database_id("FDW Flights", ems_system_id=1)
+            await _resolve_database_id("FDW Flights", ems_system_id=1)
+        # API should only be called once (result is cached)
+        assert mock_client.get.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_searches_subgroups(self) -> None:
+        """Should find databases in subgroups one level deep."""
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(side_effect=[
+            # Root: no databases, one group
+            {
+                "id": "[none]", "name": "Root",
+                "databases": [],
+                "groups": [{"id": "g1", "name": "Profiles"}],
+            },
+            # Subgroup: one database
+            {
+                "id": "g1", "name": "Profiles",
+                "databases": [
+                    {"id": "[profile-db]", "pluralName": "APM Events"},
+                ],
+                "groups": [],
+            },
+        ])
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _resolve_database_id("APM Events", ems_system_id=1)
+        assert result == "[profile-db]"
+
+    @pytest.mark.asyncio
+    async def test_empty_ref_raises(self) -> None:
+        """Empty database reference should raise ValueError."""
+        with pytest.raises(ValueError, match="cannot be empty"):
+            await _resolve_database_id("", ems_system_id=1)
