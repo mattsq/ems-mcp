@@ -1,0 +1,182 @@
+{
+  "_description": "Curated list of typical EMS field names by database. Names may vary between EMS deployments; treat as a vocabulary hint and resolve to IDs with find_fields. Not a substitute for discovery.",
+  "_usage": "After reading this resource, call find_fields(search_text=[...]) with the names you need to resolve them to actual field IDs.",
+  "FDW Flights": [
+    {
+      "name": "Flight Record",
+      "type": "number",
+      "description": "Unique flight record identifier (primary key). Required to drive query_flight_analytics.",
+      "discrete": false
+    },
+    {
+      "name": "Flight Date",
+      "type": "datetime",
+      "description": "Date the flight took place. Common filter target for date-range queries.",
+      "discrete": false
+    },
+    {
+      "name": "Flight Number",
+      "type": "string",
+      "description": "Operator's flight number (e.g. QF1).",
+      "discrete": false
+    },
+    {
+      "name": "Tail Number",
+      "type": "discrete",
+      "description": "Aircraft registration (e.g. VH-OQA). Discrete: filter accepts numeric code or label - use get_field_info or include_field_info=True to see codes.",
+      "discrete": true
+    },
+    {
+      "name": "Aircraft Type",
+      "type": "discrete",
+      "description": "Aircraft model (e.g. A330-200, B737-800). Filter on label or code.",
+      "discrete": true
+    },
+    {
+      "name": "Fleet",
+      "type": "discrete",
+      "description": "Fleet grouping that the aircraft belongs to. Discrete codes.",
+      "discrete": true
+    },
+    {
+      "name": "Takeoff Airport Code",
+      "type": "discrete",
+      "description": "ICAO/IATA code of departure airport. Discrete codes - use get_assets(asset='airports') for the full mapping.",
+      "discrete": true
+    },
+    {
+      "name": "Takeoff Airport Name",
+      "type": "string",
+      "description": "Free-text name of departure airport.",
+      "discrete": false
+    },
+    {
+      "name": "Landing Airport Code",
+      "type": "discrete",
+      "description": "ICAO/IATA code of arrival airport. Discrete codes.",
+      "discrete": true
+    },
+    {
+      "name": "Landing Airport Name",
+      "type": "string",
+      "description": "Free-text name of arrival airport.",
+      "discrete": false
+    },
+    {
+      "name": "Takeoff Time",
+      "type": "datetime",
+      "description": "Local or UTC takeoff timestamp (variants exist - search both).",
+      "discrete": false
+    },
+    {
+      "name": "Landing Time",
+      "type": "datetime",
+      "description": "Local or UTC landing timestamp.",
+      "discrete": false
+    },
+    {
+      "name": "Block Time",
+      "type": "number",
+      "description": "Total gate-to-gate time. Units typically seconds or minutes.",
+      "discrete": false
+    },
+    {
+      "name": "Flight Time",
+      "type": "number",
+      "description": "Wheels-up to wheels-down duration. Units typically seconds or minutes.",
+      "discrete": false
+    },
+    {
+      "name": "Fuel Burned",
+      "type": "number",
+      "description": "Total trip fuel burn. Units typically kg or lb.",
+      "discrete": false
+    },
+    {
+      "name": "Takeoff Fuel",
+      "type": "number",
+      "description": "Fuel onboard at takeoff. Units typically kg or lb.",
+      "discrete": false
+    },
+    {
+      "name": "Landing Fuel",
+      "type": "number",
+      "description": "Fuel onboard at landing.",
+      "discrete": false
+    },
+    {
+      "name": "Takeoff Weight",
+      "type": "number",
+      "description": "Gross weight at takeoff (TOW). Units kg or lb.",
+      "discrete": false
+    },
+    {
+      "name": "Landing Weight",
+      "type": "number",
+      "description": "Gross weight at landing.",
+      "discrete": false
+    },
+    {
+      "name": "Cruise Altitude",
+      "type": "number",
+      "description": "Maximum cruise altitude. Units feet.",
+      "discrete": false
+    },
+    {
+      "name": "Flight Phase",
+      "type": "discrete",
+      "description": "Phase of flight - usually used as an aggregation/group dimension. Discrete codes.",
+      "discrete": true
+    },
+    {
+      "name": "Departure Runway",
+      "type": "string",
+      "description": "Runway used for takeoff (e.g. 16L).",
+      "discrete": false
+    },
+    {
+      "name": "Arrival Runway",
+      "type": "string",
+      "description": "Runway used for landing.",
+      "discrete": false
+    },
+    {
+      "name": "Number of Engines",
+      "type": "number",
+      "description": "Engine count for the aircraft.",
+      "discrete": false
+    },
+    {
+      "name": "Operator",
+      "type": "discrete",
+      "description": "Operating airline. Discrete codes.",
+      "discrete": true
+    }
+  ],
+  "APM Events": [
+    {
+      "name": "Event Type",
+      "type": "discrete",
+      "description": "APM event classification. Discrete codes.",
+      "discrete": true
+    },
+    {
+      "name": "Severity",
+      "type": "discrete",
+      "description": "Event severity level. Discrete codes.",
+      "discrete": true
+    },
+    {
+      "name": "Event Time",
+      "type": "datetime",
+      "description": "Timestamp the event triggered.",
+      "discrete": false
+    },
+    {
+      "name": "Flight Record",
+      "type": "number",
+      "description": "Foreign key to FDW Flights for the parent flight.",
+      "discrete": false
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+feat: add persistent SQLite cache and parallel multi-term field search
+
+- Implement `SQLiteCache` to persist cache data across server restarts.
+- Add support for parallel, multi-term keyword search in `find_fields`.
+- Add `include_field_info` option to `find_fields` to fetch and inline complete field metadata.
+- Expand caching unit tests and add comprehensive tests for multi-term concurrent discovery behavior.

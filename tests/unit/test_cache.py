@@ -1,10 +1,11 @@
 """Unit tests for caching infrastructure."""
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
-from ems_mcp.cache import CacheEntry, SimpleCache, make_cache_key
+from ems_mcp.cache import CacheEntry, SimpleCache, SQLiteCache, make_cache_key
 
 
 class TestCacheEntry:
@@ -155,6 +156,82 @@ class TestSimpleCache:
 
         result = await cache.get("complex")
         assert result == data
+
+
+class TestSQLiteCache:
+    """Tests for the SQLite-backed persistent cache."""
+
+    @pytest.mark.asyncio
+    async def test_set_and_get(self, tmp_path: Path) -> None:
+        cache: SQLiteCache[dict] = SQLiteCache(
+            db_path=tmp_path / "c.db", namespace="test",
+        )
+        await cache.set("k", {"a": 1, "nested": [1, 2, 3]})
+        result = await cache.get("k")
+        assert result == {"a": 1, "nested": [1, 2, 3]}
+
+    @pytest.mark.asyncio
+    async def test_persists_across_instances(self, tmp_path: Path) -> None:
+        """Values written by one instance must be visible to a fresh one."""
+        db_path = tmp_path / "c.db"
+
+        first: SQLiteCache[str] = SQLiteCache(db_path=db_path, namespace="test")
+        await first.set("warm", "value", ttl=3600)
+
+        second: SQLiteCache[str] = SQLiteCache(db_path=db_path, namespace="test")
+        result = await second.get("warm")
+        assert result == "value"
+
+    @pytest.mark.asyncio
+    async def test_ttl_expires(self, tmp_path: Path) -> None:
+        import asyncio
+        cache: SQLiteCache[str] = SQLiteCache(
+            db_path=tmp_path / "c.db", namespace="test",
+        )
+        await cache.set("k", "value", ttl=0)
+        await asyncio.sleep(0.01)
+        assert await cache.get("k") is None
+
+    @pytest.mark.asyncio
+    async def test_delete(self, tmp_path: Path) -> None:
+        cache: SQLiteCache[str] = SQLiteCache(
+            db_path=tmp_path / "c.db", namespace="test",
+        )
+        await cache.set("k", "value")
+        assert await cache.delete("k") is True
+        assert await cache.delete("k") is False
+        assert await cache.get("k") is None
+
+    @pytest.mark.asyncio
+    async def test_clear_only_affects_namespace(self, tmp_path: Path) -> None:
+        """clear() should not wipe other namespaces in the same file."""
+        db_path = tmp_path / "c.db"
+        a: SQLiteCache[str] = SQLiteCache(db_path=db_path, namespace="A")
+        b: SQLiteCache[str] = SQLiteCache(db_path=db_path, namespace="B")
+
+        await a.set("k", "from-A")
+        await b.set("k", "from-B")
+        await a.clear()
+
+        assert await a.get("k") is None
+        assert await b.get("k") == "from-B"
+
+    @pytest.mark.asyncio
+    async def test_stores_lists_of_dicts(self, tmp_path: Path) -> None:
+        """The shape returned by /fields?text=... should round-trip cleanly."""
+        cache: SQLiteCache[list] = SQLiteCache(
+            db_path=tmp_path / "c.db", namespace="field",
+        )
+        sample = [
+            {"id": "f1", "name": "Altitude", "type": "number", "units": "ft"},
+            {
+                "id": "f2", "name": "Status", "type": "discrete",
+                "discreteValues": [{"value": 0, "label": "Off"}],
+            },
+        ]
+        await cache.set("k", sample)
+        result = await cache.get("k")
+        assert result == sample
 
 
 class TestMakeCacheKey:
