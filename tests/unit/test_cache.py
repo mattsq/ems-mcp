@@ -1,5 +1,8 @@
 """Unit tests for caching infrastructure."""
 
+import pickle
+import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -232,6 +235,93 @@ class TestSQLiteCache:
         await cache.set("k", sample)
         result = await cache.get("k")
         assert result == sample
+
+    @pytest.mark.asyncio
+    async def test_forged_pickle_blob_is_not_executed(self, tmp_path: Path) -> None:
+        """A forged pickle blob written directly to the DB must not be loaded.
+
+        This is the security regression test for the pickle->JSON migration:
+        anyone who can write to ``EMS_CACHE_DIR`` could otherwise plant a
+        malicious pickle that executes arbitrary code on the next cache read.
+        With JSON serialization, the blob fails to parse and is dropped.
+        """
+        db_path = tmp_path / "c.db"
+
+        # First open creates the v1 schema.
+        cache: SQLiteCache[dict] = SQLiteCache(db_path=db_path, namespace="field")
+        await cache.set("legitimate", {"ok": True})
+
+        # Simulate an attacker overwriting a row with a pickle blob.
+        sentinel: list[str] = []
+
+        class Tripwire:
+            def __reduce__(self) -> tuple:
+                return (sentinel.append, ("pwned",))
+
+        forged_blob = pickle.dumps(Tripwire())
+        now = time.time()
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO cache_entries "
+                "(namespace, key, value, expires_at, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("field", "forged", forged_blob, now + 3600, now),
+            )
+            conn.commit()
+
+        # Reading the forged entry must return None and must NOT execute the
+        # pickle reduce side effect.
+        result = await cache.get("forged")
+        assert result is None
+        assert sentinel == [], "pickle reduce executed - JSON-only invariant broken"
+
+        # Sanity: legitimate entries still work.
+        assert await cache.get("legitimate") == {"ok": True}
+
+    @pytest.mark.asyncio
+    async def test_legacy_pickle_schema_is_wiped_on_open(self, tmp_path: Path) -> None:
+        """Opening a pre-JSON pickle-format database drops cache_entries.
+
+        Older revisions of this code wrote pickle blobs and did not set
+        ``user_version``. On upgrade, the cache must rebuild rather than
+        attempt to deserialize attacker-influenceable pickle data.
+        """
+        db_path = tmp_path / "legacy.db"
+
+        # Hand-build a pre-migration database (user_version = 0, pickle row).
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE cache_entries (
+                    namespace TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    value BLOB NOT NULL,
+                    expires_at REAL NOT NULL,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY (namespace, key)
+                )
+                """
+            )
+            now = time.time()
+            conn.execute(
+                "INSERT INTO cache_entries VALUES (?, ?, ?, ?, ?)",
+                ("field", "legacy", pickle.dumps({"old": "value"}), now + 3600, now),
+            )
+            conn.commit()
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == 0
+
+        # Open via SQLiteCache - the legacy row should be wiped.
+        cache: SQLiteCache[dict] = SQLiteCache(db_path=db_path, namespace="field")
+        assert await cache.get("legacy") is None
+
+        # New writes still work and round-trip via JSON.
+        await cache.set("fresh", {"new": "value"})
+        assert await cache.get("fresh") == {"new": "value"}
+
+        # And user_version is now bumped.
+        with sqlite3.connect(db_path) as conn:
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == \
+                SQLiteCache.SCHEMA_VERSION
 
 
 class TestMakeCacheKey:

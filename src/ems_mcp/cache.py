@@ -11,9 +11,9 @@ significantly reduce first-call latency.
 """
 
 import asyncio
+import json
 import logging
 import os
-import pickle
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -172,13 +172,23 @@ class SQLiteCache(Generic[T]):
     """Persistent async-safe cache backed by SQLite.
 
     Drop-in replacement for ``SimpleCache`` that survives process restarts.
-    Values are stored as pickled blobs (JSON would lose type information for
-    nested dict/list payloads from the EMS API). Schema is partitioned by
-    ``namespace`` so caches for multiple EMS endpoints can share one file.
+    Values are stored as UTF-8-encoded JSON blobs. The cache only ever holds
+    payloads that originated as JSON from the EMS API (lists/dicts/primitives),
+    so JSON is sufficient and avoids the arbitrary-code-execution risk that
+    ``pickle.loads`` would introduce on a writable cache directory.
+
+    Schema is partitioned by ``namespace`` so caches for multiple EMS endpoints
+    can share one file. ``PRAGMA user_version`` is used to gate the on-disk
+    format: opening an older database (including any pre-JSON pickle-format
+    cache) drops and recreates ``cache_entries``, wiping all namespaces in the
+    file. The cache is rebuildable, and refusing to load attacker-controlled
+    blobs is the whole point.
 
     All blocking I/O is dispatched through ``asyncio.to_thread`` to keep the
     event loop responsive.
     """
+
+    SCHEMA_VERSION = 1
 
     SCHEMA = """
         CREATE TABLE IF NOT EXISTS cache_entries (
@@ -222,6 +232,15 @@ class SQLiteCache(Generic[T]):
 
     def _init_db(self) -> None:
         with self._connect() as conn:
+            current_version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if current_version < self.SCHEMA_VERSION:
+                if current_version > 0:
+                    logger.info(
+                        "SQLiteCache at %s: upgrading schema %d -> %d (rebuilding cache)",
+                        self._db_path, current_version, self.SCHEMA_VERSION,
+                    )
+                conn.execute("DROP TABLE IF EXISTS cache_entries")
+                conn.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
             conn.executescript(self.SCHEMA)
 
     def _get_sync(self, key: str) -> T | None:
@@ -242,13 +261,27 @@ class SQLiteCache(Generic[T]):
                 )
                 conn.commit()
                 return None
-        loaded: T = pickle.loads(value_blob)
+            try:
+                loaded: T = json.loads(bytes(value_blob).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+                # Corrupted or alien-format blob (e.g. legacy pickle that
+                # slipped past the schema-version check). Drop and miss.
+                logger.warning(
+                    "SQLiteCache: dropping unparseable value at %s/%s",
+                    self._namespace, key,
+                )
+                conn.execute(
+                    "DELETE FROM cache_entries WHERE namespace = ? AND key = ?",
+                    (self._namespace, key),
+                )
+                conn.commit()
+                return None
         return loaded
 
     def _set_sync(self, key: str, value: T, ttl: int) -> None:
         now = datetime.now(UTC).timestamp()
         expires_at = now + ttl
-        blob = pickle.dumps(value)
+        blob = json.dumps(value).encode("utf-8")
         with self._connect() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO cache_entries "

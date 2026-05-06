@@ -28,6 +28,13 @@ _result_store: dict[int, dict[str, Any]] = {}
 _next_ref: int = 0
 _STORE_MAX_SIZE: int = 500
 
+# Maximum concurrent EMS API requests issued by a single field-discovery call
+# (multi-term search fan-out and per-result get_field_info enrichment). Caps
+# how hard we hit the backend when an LLM hands us a long list of terms or a
+# search returns many fields to enrich. A small value (5) leaves headroom under
+# typical EMS rate limits while still preserving meaningful parallelism.
+_MAX_CONCURRENT_FIELD_REQUESTS: int = 5
+
 
 def _store_result(
     name: str,
@@ -1043,8 +1050,14 @@ async def _do_search_fields_multi(
 
     client = get_client()
 
+    sem = asyncio.Semaphore(_MAX_CONCURRENT_FIELD_REQUESTS)
+
+    async def _bounded_fetch(term: str) -> Any:
+        async with sem:
+            return await _fetch_field_search(client, ems_system_id, database_id, term)
+
     results = await asyncio.gather(
-        *(_fetch_field_search(client, ems_system_id, database_id, term) for term in cleaned),
+        *(_bounded_fetch(term) for term in cleaned),
         return_exceptions=True,
     )
 
@@ -1117,24 +1130,27 @@ async def _enrich_with_field_info(
     if not fields:
         return fields
 
+    sem = asyncio.Semaphore(_MAX_CONCURRENT_FIELD_REQUESTS)
+
     async def _fetch_one(field: dict[str, Any]) -> dict[str, Any]:
         field_id = field.get("id", "")
         if not field_id:
             return field
 
-        cache_key = make_cache_key("field_info", ems_system_id, database_id, field_id)
-        info = await field_cache.get(cache_key)
-        if info is None:
-            try:
-                encoded = urllib.parse.quote(field_id, safe="")
-                path = (
-                    f"/api/v2/ems-systems/{ems_system_id}/databases/"
-                    f"{database_id}/fields/{encoded}"
-                )
-                info = await client.get(path)
-                await field_cache.set(cache_key, info)
-            except (EMSAPIError, EMSNotFoundError):
-                return field
+        async with sem:
+            cache_key = make_cache_key("field_info", ems_system_id, database_id, field_id)
+            info = await field_cache.get(cache_key)
+            if info is None:
+                try:
+                    encoded = urllib.parse.quote(field_id, safe="")
+                    path = (
+                        f"/api/v2/ems-systems/{ems_system_id}/databases/"
+                        f"{database_id}/fields/{encoded}"
+                    )
+                    info = await client.get(path)
+                    await field_cache.set(cache_key, info)
+                except (EMSAPIError, EMSNotFoundError):
+                    return field
 
         merged = dict(field)
         if "description" in info and "description" not in merged:

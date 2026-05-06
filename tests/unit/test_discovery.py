@@ -702,6 +702,46 @@ class TestFindFieldsSearch:
         assert 'Search: "gamma"' in result
 
     @pytest.mark.asyncio
+    async def test_search_fields_multi_term_concurrency_is_capped(self) -> None:
+        """Multi-term fan-out must not exceed _MAX_CONCURRENT_FIELD_REQUESTS."""
+        from ems_mcp.tools.discovery import _MAX_CONCURRENT_FIELD_REQUESTS
+
+        in_flight = 0
+        peak_concurrency = 0
+
+        async def slow_get(path: str, **kwargs: Any) -> Any:
+            nonlocal in_flight, peak_concurrency
+            in_flight += 1
+            peak_concurrency = max(peak_concurrency, in_flight)
+            try:
+                # Hold long enough that backed-up tasks queue on the semaphore.
+                await asyncio.sleep(0.02)
+                term = kwargs.get("params", {}).get("text", "")
+                return [{"id": f"f-{term}", "name": f"Field {term}", "type": "string"}]
+            finally:
+                in_flight -= 1
+
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(side_effect=slow_get)
+
+        terms = [f"term-{i}" for i in range(_MAX_CONCURRENT_FIELD_REQUESTS * 2 + 2)]
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _find_fields(
+                ems_system_id=1, database_id="[ems-core]",
+                mode="search", search_text=terms,
+            )
+
+        assert mock_client.get.call_count == len(terms)
+        assert peak_concurrency <= _MAX_CONCURRENT_FIELD_REQUESTS, (
+            f"Peak concurrency {peak_concurrency} exceeded "
+            f"cap of {_MAX_CONCURRENT_FIELD_REQUESTS}"
+        )
+        # And every term still surfaced in the output
+        for term in terms:
+            assert f'Search: "{term}"' in result
+
+    @pytest.mark.asyncio
     async def test_search_fields_multi_term_dedups_and_strips(self) -> None:
         """Multi-term should deduplicate case-insensitively and skip empties."""
         mock_client = MagicMock()

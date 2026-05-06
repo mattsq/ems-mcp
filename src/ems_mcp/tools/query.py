@@ -95,11 +95,14 @@ async def _resolve_analytics(
             results.append((item, item))
             continue
 
-        # Check cache first
+        # Check cache first. The cache stores [name, id] as a list because the
+        # SQLite cache backend serializes via JSON (which has no tuple type);
+        # convert back to a tuple here so the in-memory return shape stays
+        # consistent with the type annotation.
         cache_key = make_cache_key("analytic_resolve", ems_system_id, item.lower())
         cached = await field_cache.get(cache_key)
         if cached is not None:
-            results.append(cached)
+            results.append(tuple(cached))
             continue
 
         # Search the analytics API
@@ -120,14 +123,14 @@ async def _resolve_analytics(
         ]
         if len(exact_matches) == 1:
             pair = (exact_matches[0]["name"], exact_matches[0]["id"])
-            await field_cache.set(cache_key, pair)
+            await field_cache.set(cache_key, list(pair))
             results.append(pair)
             continue
 
         # If only one result total, use it
         if len(search_results) == 1:
             pair = (search_results[0]["name"], search_results[0]["id"])
-            await field_cache.set(cache_key, pair)
+            await field_cache.set(cache_key, list(pair))
             results.append(pair)
             continue
 
