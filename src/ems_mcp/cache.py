@@ -184,8 +184,17 @@ class SQLiteCache(Generic[T]):
     file. The cache is rebuildable, and refusing to load attacker-controlled
     blobs is the whole point.
 
-    All blocking I/O is dispatched through ``asyncio.to_thread`` to keep the
-    event loop responsive.
+    Concurrency model: each operation opens its own ``sqlite3.Connection`` and
+    SQLite is run in WAL mode, so reads can proceed in parallel and writes
+    serialise at the SQL layer via ``INSERT OR REPLACE``. Async operations
+    (``get``/``set``/``delete``/``clear``/``size``) dispatch their blocking
+    SQLite call through ``asyncio.to_thread`` and hold no asyncio lock, so
+    the cache does not bottleneck callers that fan out concurrent requests.
+
+    Construction (``__init__``) is intentionally synchronous: it creates the
+    cache directory, opens a connection, and runs schema migration. This is a
+    one-time cost paid at module import (where the global ``field_cache`` is
+    built) and is not awaited from the event loop hot path.
     """
 
     SCHEMA_VERSION = 1
@@ -220,7 +229,6 @@ class SQLiteCache(Generic[T]):
         self._db_path = Path(db_path)
         self._namespace = namespace
         self._default_ttl = default_ttl
-        self._lock = asyncio.Lock()
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
@@ -316,37 +324,32 @@ class SQLiteCache(Generic[T]):
             return int(row[0]) if row else 0
 
     async def get(self, key: str) -> T | None:
-        async with self._lock:
-            value = await asyncio.to_thread(self._get_sync, key)
-            if value is None:
-                logger.debug("SQLite cache miss: %s/%s", self._namespace, key)
-            else:
-                logger.debug("SQLite cache hit: %s/%s", self._namespace, key)
-            return value
+        value = await asyncio.to_thread(self._get_sync, key)
+        if value is None:
+            logger.debug("SQLite cache miss: %s/%s", self._namespace, key)
+        else:
+            logger.debug("SQLite cache hit: %s/%s", self._namespace, key)
+        return value
 
     async def set(self, key: str, value: T, ttl: int | None = None) -> None:
-        async with self._lock:
-            await asyncio.to_thread(
-                self._set_sync, key, value, ttl if ttl is not None else self._default_ttl,
-            )
-            logger.debug(
-                "SQLite cache set: %s/%s (TTL: %ds)",
-                self._namespace,
-                key,
-                ttl if ttl is not None else self._default_ttl,
-            )
+        await asyncio.to_thread(
+            self._set_sync, key, value, ttl if ttl is not None else self._default_ttl,
+        )
+        logger.debug(
+            "SQLite cache set: %s/%s (TTL: %ds)",
+            self._namespace,
+            key,
+            ttl if ttl is not None else self._default_ttl,
+        )
 
     async def delete(self, key: str) -> bool:
-        async with self._lock:
-            return await asyncio.to_thread(self._delete_sync, key)
+        return await asyncio.to_thread(self._delete_sync, key)
 
     async def clear(self) -> None:
-        async with self._lock:
-            await asyncio.to_thread(self._clear_sync)
+        await asyncio.to_thread(self._clear_sync)
 
-    @property
-    def size(self) -> int:
-        return self._size_sync()
+    async def size(self) -> int:
+        return await asyncio.to_thread(self._size_sync)
 
 
 def _build_field_cache() -> "SimpleCache[Any] | SQLiteCache[Any]":

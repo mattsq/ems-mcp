@@ -7,7 +7,7 @@ These are ideal for stable data like system lists, fleet catalogs, and workflow 
 import json
 import logging
 import urllib.parse
-from pathlib import Path
+from importlib import resources
 from typing import Any
 
 from ems_mcp.api.client import EMSAPIError
@@ -16,17 +16,42 @@ from ems_mcp.server import get_client, mcp
 
 logger = logging.getLogger(__name__)
 
-_COMMON_FIELDS_PATH = Path(__file__).parent / "data" / "common_fields.json"
+_COMMON_FIELDS_RESOURCE = ("ems_mcp", "data/common_fields.json")
 _common_fields_cache: dict[str, Any] | None = None
+_logged_load_error: bool = False
 
 
 def _load_common_fields() -> dict[str, Any]:
-    """Load and cache the curated common-fields catalog from disk."""
-    global _common_fields_cache  # noqa: PLW0603
-    if _common_fields_cache is None:
-        with _COMMON_FIELDS_PATH.open(encoding="utf-8") as f:
-            _common_fields_cache = json.load(f)
-    return _common_fields_cache
+    """Load and cache the curated common-fields catalog.
+
+    Uses ``importlib.resources`` so the JSON file resolves correctly when
+    the package is installed from a wheel or imported from a zip. On a
+    successful load the catalog is memoised for the lifetime of the
+    process; on failure (missing file, parse error, I/O error) we log
+    once and return an empty dict so callers degrade to their normal
+    "no curated list for this database" output. The failure is *not*
+    memoised, so a transiently missing file (e.g. installed late) is
+    picked up on the next access without restarting the server.
+    """
+    global _common_fields_cache, _logged_load_error  # noqa: PLW0603
+    if _common_fields_cache is not None:
+        return _common_fields_cache
+
+    package, name = _COMMON_FIELDS_RESOURCE
+    try:
+        raw = resources.files(package).joinpath(name).read_text(encoding="utf-8")
+        _common_fields_cache = json.loads(raw)
+        _logged_load_error = False
+        return _common_fields_cache
+    except (FileNotFoundError, OSError, json.JSONDecodeError) as e:
+        if not _logged_load_error:
+            logger.warning(
+                "Could not load common-fields catalog at %s/%s (%s: %s); "
+                "common-fields resources will return empty results.",
+                package, name, type(e).__name__, e,
+            )
+            _logged_load_error = True
+        return {}
 
 
 @mcp.resource("ems://workflow-guide")
