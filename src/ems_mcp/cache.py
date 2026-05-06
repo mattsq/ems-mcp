@@ -247,10 +247,10 @@ class SQLiteCache(Generic[T]):
     def _init_db(self) -> None:
         with self._connect() as conn:
             current_version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if current_version < self.SCHEMA_VERSION:
+            if current_version != self.SCHEMA_VERSION:
                 if current_version > 0:
                     logger.info(
-                        "SQLiteCache at %s: upgrading schema %d -> %d (rebuilding cache)",
+                        "SQLiteCache at %s: schema version mismatch (%d != %d), rebuilding cache",
                         self._db_path, current_version, self.SCHEMA_VERSION,
                     )
                 conn.execute("DROP TABLE IF EXISTS cache_entries")
