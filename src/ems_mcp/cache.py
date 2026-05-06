@@ -203,6 +203,7 @@ class SQLiteCache(Generic[T]):
     """
 
     SCHEMA_VERSION = 1
+    _PRUNE_EVERY = 50  # prune expired rows every N writes
 
     SCHEMA = """
         CREATE TABLE IF NOT EXISTS cache_entries (
@@ -234,6 +235,7 @@ class SQLiteCache(Generic[T]):
         self._db_path = Path(db_path)
         self._namespace = namespace
         self._default_ttl = default_ttl
+        self._write_count = 0
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
@@ -255,6 +257,10 @@ class SQLiteCache(Generic[T]):
                 conn.execute("DROP TABLE IF EXISTS cache_entries")
                 conn.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
             conn.executescript(self.SCHEMA)
+            # Prune expired entries left over from previous runs.
+            now = datetime.now(UTC).timestamp()
+            conn.execute("DELETE FROM cache_entries WHERE expires_at <= ?", (now,))
+            conn.commit()
 
     def _get_sync(self, key: str) -> T | None:
         now = datetime.now(UTC).timestamp()
@@ -302,6 +308,14 @@ class SQLiteCache(Generic[T]):
                 "VALUES (?, ?, ?, ?, ?)",
                 (self._namespace, key, blob, expires_at, now),
             )
+            # Prune expired rows periodically (every ~50 writes, lightweight).
+            # This prevents unbounded growth from long-lived persistent caches.
+            self._write_count += 1
+            if self._write_count >= self._PRUNE_EVERY:
+                conn.execute(
+                    "DELETE FROM cache_entries WHERE expires_at <= ?", (now,)
+                )
+                self._write_count = 0
             conn.commit()
 
     def _delete_sync(self, key: str) -> bool:
@@ -329,7 +343,11 @@ class SQLiteCache(Generic[T]):
             return int(row[0]) if row else 0
 
     async def get(self, key: str) -> T | None:
-        value = await asyncio.to_thread(self._get_sync, key)
+        try:
+            value = await asyncio.to_thread(self._get_sync, key)
+        except (sqlite3.Error, OSError) as e:
+            logger.warning("SQLiteCache.get failed (%s); treating as miss", e)
+            return None
         if value is None:
             logger.debug("SQLite cache miss: %s/%s", self._namespace, key)
         else:
@@ -337,9 +355,13 @@ class SQLiteCache(Generic[T]):
         return value
 
     async def set(self, key: str, value: T, ttl: int | None = None) -> None:
-        await asyncio.to_thread(
-            self._set_sync, key, value, ttl if ttl is not None else self._default_ttl,
-        )
+        try:
+            await asyncio.to_thread(
+                self._set_sync, key, value, ttl if ttl is not None else self._default_ttl,
+            )
+        except (sqlite3.Error, OSError) as e:
+            logger.warning("SQLiteCache.set failed (%s); write dropped", e)
+            return
         logger.debug(
             "SQLite cache set: %s/%s (TTL: %ds)",
             self._namespace,
@@ -348,10 +370,17 @@ class SQLiteCache(Generic[T]):
         )
 
     async def delete(self, key: str) -> bool:
-        return await asyncio.to_thread(self._delete_sync, key)
+        try:
+            return await asyncio.to_thread(self._delete_sync, key)
+        except (sqlite3.Error, OSError) as e:
+            logger.warning("SQLiteCache.delete failed (%s); treating as no-op", e)
+            return False
 
     async def clear(self) -> None:
-        await asyncio.to_thread(self._clear_sync)
+        try:
+            await asyncio.to_thread(self._clear_sync)
+        except (sqlite3.Error, OSError) as e:
+            logger.warning("SQLiteCache.clear failed (%s); treating as no-op", e)
 
     @property
     def size(self) -> int:
