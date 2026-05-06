@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 
+from ems_mcp.api._ssl import get_verify_setting
 from ems_mcp.api.models import CachedToken, OAuthErrorResponse, TokenResponse
 from ems_mcp.config import EMSSettings, get_settings
 
@@ -121,7 +122,7 @@ class TokenManager:
         logger.debug("Requesting new token from %s", token_url)
 
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(verify=get_verify_setting()) as client:
                 response = await client.post(
                     token_url,
                     headers=headers,

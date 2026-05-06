@@ -69,8 +69,12 @@ EMS flight data analytics server. Follow this workflow:
 DISCOVERY (required before querying):
 1. list_ems_systems -> get system ID (usually 1)
 2. list_databases -> find database names (e.g. "FDW Flights")
-3. find_fields(mode="search") -> find fields by keyword
-4. get_field_info -> check discrete value codes for filtering
+3. find_fields(mode="search") -> find fields by keyword. Pass a list to \
+search_text to look up many terms in parallel in a single tool call \
+(e.g. search_text=["fuel burn", "tail", "takeoff airport"]).
+4. get_field_info -> check discrete value codes for filtering. Or skip \
+this by calling find_fields(..., include_field_info=True) which fetches \
+discrete value mappings inline.
 
 FIELD REFERENCES:
 - find_fields returns numbered [N] references. Use these directly in \

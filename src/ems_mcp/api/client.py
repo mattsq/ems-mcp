@@ -12,6 +12,7 @@ from typing import Any
 
 import httpx
 
+from ems_mcp.api._ssl import get_verify_setting
 from ems_mcp.api.auth import AuthenticationError, TokenManager
 from ems_mcp.api.models import EMSErrorResponse, RetryConfig
 from ems_mcp.config import EMSSettings, get_settings
@@ -119,6 +120,7 @@ class EMSClient:
         self._http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(self._settings.request_timeout),
             follow_redirects=True,
+            verify=get_verify_setting(),
         )
         logger.debug("EMSClient initialized")
 

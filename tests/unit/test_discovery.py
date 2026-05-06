@@ -1,5 +1,6 @@
 """Unit tests for EMS MCP discovery tools."""
 
+import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -182,6 +183,62 @@ class TestFormatters:
         assert "[0]" in result
         assert "[1]" in result
         assert "reference numbers or field names" in result
+
+    def test_format_field_search_results_includes_description(self) -> None:
+        """Description should pass through to output when present."""
+        _reset_result_store()
+        fields = [
+            {"id": "f1", "name": "Flight Date", "type": "datetime",
+             "description": "Local time of takeoff"},
+        ]
+        result = _format_field_search_results(fields)
+        assert "Local time of takeoff" in result
+
+    def test_format_field_search_results_includes_discrete_values(self) -> None:
+        """Discrete values returned by the search API should appear inline."""
+        _reset_result_store()
+        fields = [
+            {
+                "id": "f1", "name": "Tail Number", "type": "discrete",
+                "discreteValues": [
+                    {"value": 407, "label": "VH-OQA"},
+                    {"value": 411, "label": "VH-OQB"},
+                ],
+            },
+        ]
+        result = _format_field_search_results(fields)
+        assert "Discrete values (2)" in result
+        assert "407: VH-OQA" in result
+        assert "411: VH-OQB" in result
+
+    def test_format_field_search_results_truncates_many_discrete_values(self) -> None:
+        """Long discrete-value lists should truncate with a hint."""
+        _reset_result_store()
+        fields = [
+            {
+                "id": "f1", "name": "Airport Code", "type": "discrete",
+                "discreteValues": [
+                    {"value": i, "label": f"APT{i}"} for i in range(50)
+                ],
+            },
+        ]
+        result = _format_field_search_results(fields)
+        assert "Discrete values (50)" in result
+        assert "... and 40 more" in result
+        assert "include_field_info=True" in result
+
+    def test_format_field_search_results_handles_dict_discrete_values(self) -> None:
+        """Dict-form discreteValues mapping should also format correctly."""
+        _reset_result_store()
+        fields = [
+            {
+                "id": "f1", "name": "Airport", "type": "discrete",
+                "discreteValues": {"676": "YPKA", "411": "YPKG"},
+            },
+        ]
+        result = _format_field_search_results(fields)
+        assert "Discrete values (2)" in result
+        assert "676: YPKA" in result
 
     def test_format_field_search_results_show_ids(self) -> None:
         """Format search results with show_ids=True shows full IDs."""
@@ -608,6 +665,205 @@ class TestFindFieldsSearch:
         assert "Error" in result
         assert "entity-type database" in result
         assert "find_fields" in result or "mode='deep'" in result
+
+    @pytest.mark.asyncio
+    async def test_search_fields_multi_term_runs_in_parallel(self) -> None:
+        """Multi-term search should fan out concurrent API calls."""
+
+        in_flight = 0
+        peak_concurrency = 0
+
+        async def fake_get(path: str, **kwargs: Any) -> Any:
+            nonlocal in_flight, peak_concurrency
+            in_flight += 1
+            peak_concurrency = max(peak_concurrency, in_flight)
+            try:
+                # Yield to the event loop so all calls overlap
+                await asyncio.sleep(0)
+                term = kwargs.get("params", {}).get("text", "")
+                return [{"id": f"f-{term}", "name": f"Field {term}", "type": "string"}]
+            finally:
+                in_flight -= 1
+
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(side_effect=fake_get)
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _find_fields(
+                ems_system_id=1, database_id="[ems-core]",
+                mode="search", search_text=["alpha", "beta", "gamma"],
+            )
+
+        assert mock_client.get.call_count == 3
+        assert peak_concurrency >= 2  # Confirms parallel dispatch
+        assert "Multi-term search" in result
+        assert 'Search: "alpha"' in result
+        assert 'Search: "beta"' in result
+        assert 'Search: "gamma"' in result
+
+    @pytest.mark.asyncio
+    async def test_search_fields_multi_term_concurrency_is_capped(self) -> None:
+        """Multi-term fan-out must not exceed _MAX_CONCURRENT_FIELD_REQUESTS."""
+        from ems_mcp.tools.discovery import _MAX_CONCURRENT_FIELD_REQUESTS
+
+        in_flight = 0
+        peak_concurrency = 0
+
+        async def slow_get(path: str, **kwargs: Any) -> Any:
+            nonlocal in_flight, peak_concurrency
+            in_flight += 1
+            peak_concurrency = max(peak_concurrency, in_flight)
+            try:
+                # Hold long enough that backed-up tasks queue on the semaphore.
+                await asyncio.sleep(0.02)
+                term = kwargs.get("params", {}).get("text", "")
+                return [{"id": f"f-{term}", "name": f"Field {term}", "type": "string"}]
+            finally:
+                in_flight -= 1
+
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(side_effect=slow_get)
+
+        terms = [f"term-{i}" for i in range(_MAX_CONCURRENT_FIELD_REQUESTS * 2 + 2)]
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _find_fields(
+                ems_system_id=1, database_id="[ems-core]",
+                mode="search", search_text=terms,
+            )
+
+        assert mock_client.get.call_count == len(terms)
+        assert peak_concurrency <= _MAX_CONCURRENT_FIELD_REQUESTS, (
+            f"Peak concurrency {peak_concurrency} exceeded "
+            f"cap of {_MAX_CONCURRENT_FIELD_REQUESTS}"
+        )
+        # And every term still surfaced in the output
+        for term in terms:
+            assert f'Search: "{term}"' in result
+
+    @pytest.mark.asyncio
+    async def test_search_fields_multi_term_dedups_and_strips(self) -> None:
+        """Multi-term should deduplicate case-insensitively and skip empties."""
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value=[
+            {"id": "f1", "name": "Result", "type": "string"},
+        ])
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _find_fields(
+                ems_system_id=1, database_id="[ems-core]",
+                mode="search",
+                search_text=["alpha", "  alpha  ", "ALPHA", "", "beta"],
+            )
+
+        # Two unique terms after normalization
+        assert mock_client.get.call_count == 2
+        assert 'Search: "alpha"' in result
+        assert 'Search: "beta"' in result
+
+    @pytest.mark.asyncio
+    async def test_search_fields_multi_term_individual_caching(self) -> None:
+        """A multi-term call should populate per-term cache entries."""
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value=[
+            {"id": "f1", "name": "Found", "type": "string"},
+        ])
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            await _find_fields(
+                ems_system_id=1, database_id="[ems-core]",
+                mode="search", search_text=["alpha", "beta"],
+            )
+            # Subsequent single-term call for one of the terms should hit cache
+            await _find_fields(
+                ems_system_id=1, database_id="[ems-core]",
+                mode="search", search_text="alpha",
+            )
+
+        # Original 2 multi-term calls + 0 follow-up (cache hit)
+        assert mock_client.get.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_search_fields_multi_term_empty_list_errors(self) -> None:
+        """Empty or whitespace-only list should return an error."""
+        result = await _find_fields(
+            ems_system_id=1, database_id="[ems-core]",
+            mode="search", search_text=["", "   "],
+        )
+        assert "Error" in result
+        assert "no usable" in result
+
+    @pytest.mark.asyncio
+    async def test_search_fields_multi_term_partial_failure(self) -> None:
+        """One term failing should not block the others."""
+        from ems_mcp.api.client import EMSAPIError
+
+        async def selective_fail(path: str, **kwargs: Any) -> Any:
+            term = kwargs.get("params", {}).get("text", "")
+            if term == "broken":
+                raise EMSAPIError("Server crashed", status_code=500)
+            return [{"id": f"f-{term}", "name": f"Field {term}", "type": "string"}]
+
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(side_effect=selective_fail)
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _find_fields(
+                ems_system_id=1, database_id="[ems-core]",
+                mode="search", search_text=["good", "broken", "also-good"],
+            )
+
+        assert "Field good" in result
+        assert "Field also-good" in result
+        assert "Server crashed" in result
+
+    @pytest.mark.asyncio
+    async def test_deep_mode_rejects_list_search_text(self) -> None:
+        """Deep mode should not accept multi-term lists."""
+        result = await _find_fields(
+            ems_system_id=1, database_id="[db]",
+            mode="deep", search_text=["a", "b"],
+        )
+        assert "Error" in result
+        assert "deep mode does not support multi-term" in result
+
+    @pytest.mark.asyncio
+    async def test_search_fields_include_field_info_fans_out(self) -> None:
+        """include_field_info should trigger parallel get_field_info calls."""
+
+        async def fake_get(path: str, **kwargs: Any) -> Any:
+            if "params" in kwargs and "text" in kwargs.get("params", {}):
+                return [
+                    {"id": "field-a", "name": "Status", "type": "discrete"},
+                    {"id": "field-b", "name": "Phase", "type": "discrete"},
+                ]
+            # field-info request for a specific field id
+            if path.endswith("/field-a") or "%5B" in path and "field-a" in path:
+                return {
+                    "id": "field-a", "name": "Status", "type": "discrete",
+                    "discreteValues": [{"value": 0, "label": "Off"}],
+                }
+            if path.endswith("/field-b") or "field-b" in path:
+                return {
+                    "id": "field-b", "name": "Phase", "type": "discrete",
+                    "discreteValues": [{"value": 1, "label": "Climb"}],
+                }
+            return {}
+
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(side_effect=fake_get)
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _find_fields(
+                ems_system_id=1, database_id="[ems-core]",
+                mode="search", search_text="status",
+                include_field_info=True,
+            )
+
+        # 1 search call + 2 field-info calls
+        assert mock_client.get.call_count == 3
+        assert "Off" in result
+        assert "Climb" in result
 
     @pytest.mark.asyncio
     async def test_search_fields_405_mentions_entity_type(self) -> None:
@@ -1518,6 +1774,121 @@ class TestResolveFieldId:
             "[-hub-][field][test]", ems_system_id=1, database_id="[db]"
         )
         assert result == "[-hub-][field][test]"
+
+    @pytest.mark.asyncio
+    async def test_name_resolved_from_result_store_skips_api(self) -> None:
+        """A name already in the result store should not trigger an API call."""
+        _store_result(
+            "Takeoff Airport Name", "[-hub-][field][takeoff-apt]",
+            ems_system_id=1, database_id="[db]",
+        )
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value=[])
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _resolve_field_id(
+                "Takeoff Airport Name", ems_system_id=1, database_id="[db]"
+            )
+
+        assert result == "[-hub-][field][takeoff-apt]"
+        mock_client.get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_name_resolved_from_store_case_insensitive(self) -> None:
+        """Result-store lookup should ignore case."""
+        _store_result(
+            "Flight Date", "[-hub-][field][date]",
+            ems_system_id=1, database_id="[db]",
+        )
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value=[])
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _resolve_field_id(
+                "flight date", ems_system_id=1, database_id="[db]"
+            )
+
+        assert result == "[-hub-][field][date]"
+        mock_client.get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_name_in_store_for_analytic_falls_through(self) -> None:
+        """Analytic entries in the store should not satisfy a field-name lookup."""
+        _store_result(
+            "Airspeed", "H4sIAAAA...",
+            result_type="analytic", ems_system_id=1,
+        )
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value=[
+            {"id": "field-air", "name": "Airspeed"},
+        ])
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _resolve_field_id(
+                "Airspeed", ems_system_id=1, database_id="[db]"
+            )
+
+        # API should be hit because store entry is an analytic, not a field
+        assert result == "field-air"
+        mock_client.get.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_store_lookup_does_not_cross_databases(self) -> None:
+        """Names stored against database A must not satisfy a lookup in database B."""
+        _store_result(
+            "Flight Date", "[fdw-flights-flight-date]",
+            ems_system_id=1, database_id="[FDW Flights]",
+        )
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value=[
+            {"id": "[apm-events-flight-date]", "name": "Flight Date"},
+        ])
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _resolve_field_id(
+                "Flight Date", ems_system_id=1, database_id="[APM Events]",
+            )
+
+        # Must not return the FDW Flights id; should hit the API for APM Events
+        assert result == "[apm-events-flight-date]"
+        mock_client.get.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_store_lookup_does_not_cross_ems_systems(self) -> None:
+        """Names stored under one EMS system must not satisfy a different system."""
+        _store_result(
+            "Flight Date", "[sys-1-id]",
+            ems_system_id=1, database_id="[db]",
+        )
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value=[
+            {"id": "[sys-2-id]", "name": "Flight Date"},
+        ])
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _resolve_field_id(
+                "Flight Date", ems_system_id=2, database_id="[db]",
+            )
+
+        assert result == "[sys-2-id]"
+        mock_client.get.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_store_lookup_ignores_unscoped_legacy_entries(self) -> None:
+        """Entries stored without scope (legacy) must not be returned."""
+        _store_result("Flight Date", "[legacy-id]")  # no ems/db scope
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value=[
+            {"id": "[fresh-id]", "name": "Flight Date"},
+        ])
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _resolve_field_id(
+                "Flight Date", ems_system_id=1, database_id="[db]",
+            )
+
+        assert result == "[fresh-id]"
+        mock_client.get.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_name_exact_match(self) -> None:

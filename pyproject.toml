@@ -50,6 +50,8 @@ Repository = "https://github.com/example/ems-mcp"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ems_mcp"]
+# Non-.py files under src/ems_mcp/ (e.g. data/common_fields.json) are
+# included automatically by hatchling when the parent package is listed.
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

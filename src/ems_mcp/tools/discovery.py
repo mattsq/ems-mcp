@@ -5,6 +5,7 @@ Discovery must be performed before querying data, as field and analytic IDs are
 opaque strings that cannot be constructed manually.
 """
 
+import asyncio
 import logging
 import urllib.parse
 from collections import deque
@@ -23,12 +24,25 @@ logger = logging.getLogger(__name__)
 # displaying full opaque IDs. The agent can later call get_result_id([N, ...])
 # to retrieve the actual IDs for the specific results it needs.
 
-_result_store: dict[int, dict[str, str]] = {}
+_result_store: dict[int, dict[str, Any]] = {}
 _next_ref: int = 0
 _STORE_MAX_SIZE: int = 500
 
+# Maximum concurrent EMS API requests issued by a single field-discovery call
+# (multi-term search fan-out and per-result get_field_info enrichment). Caps
+# how hard we hit the backend when an LLM hands us a long list of terms or a
+# search returns many fields to enrich. A small value (5) leaves headroom under
+# typical EMS rate limits while still preserving meaningful parallelism.
+_MAX_CONCURRENT_FIELD_REQUESTS: int = 5
 
-def _store_result(name: str, result_id: str, result_type: str = "field") -> int:
+
+def _store_result(
+    name: str,
+    result_id: str,
+    result_type: str = "field",
+    ems_system_id: int | None = None,
+    database_id: str | None = None,
+) -> int:
     """Store a result and return its reference number.
 
     Entries accumulate across searches so the agent can reference results
@@ -39,6 +53,10 @@ def _store_result(name: str, result_id: str, result_type: str = "field") -> int:
         name: Human-readable name of the result.
         result_id: The full opaque ID string.
         result_type: Type of result: ``"field"`` or ``"analytic"``.
+        ems_system_id: EMS system the result belongs to. Used to scope
+            name-based lookups; analytic entries only need this.
+        database_id: Database the result belongs to (fields only). Used to
+            prevent cross-database name collisions in lookup.
 
     Returns:
         The reference number assigned to this result.
@@ -47,7 +65,13 @@ def _store_result(name: str, result_id: str, result_type: str = "field") -> int:
 
     ref = _next_ref
     _next_ref += 1
-    _result_store[ref] = {"name": name, "id": result_id, "type": result_type}
+    _result_store[ref] = {
+        "name": name,
+        "id": result_id,
+        "type": result_type,
+        "ems_system_id": ems_system_id,
+        "database_id": database_id,
+    }
 
     # Evict oldest entries when over capacity
     if len(_result_store) > _STORE_MAX_SIZE:
@@ -58,7 +82,7 @@ def _store_result(name: str, result_id: str, result_type: str = "field") -> int:
     return ref
 
 
-def _get_stored_result(ref: int) -> dict[str, str] | None:
+def _get_stored_result(ref: int) -> dict[str, Any] | None:
     """Look up a stored result by reference number.
 
     Args:
@@ -68,6 +92,40 @@ def _get_stored_result(ref: int) -> dict[str, str] | None:
         Dict with ``name`` and ``id`` keys, or ``None`` if not found.
     """
     return _result_store.get(ref)
+
+
+def _find_stored_field_by_name(
+    name: str,
+    ems_system_id: int,
+    database_id: str,
+) -> str | None:
+    """Find a stored field result by case-insensitive name + DB scope match.
+
+    Only matches entries whose stored ``type`` is ``"field"`` AND that were
+    stored against the same ``(ems_system_id, database_id)`` pair. Entries
+    stored without scope (legacy behavior) never match -- they would risk
+    returning IDs from a different database.
+
+    Args:
+        name: The field name to look up.
+        ems_system_id: EMS system the lookup is scoped to.
+        database_id: Database the lookup is scoped to.
+
+    Returns:
+        The stored field ID if exactly one match is found, or None.
+    """
+    name_lower = name.lower()
+    matches: list[str] = [
+        str(entry["id"])
+        for entry in _result_store.values()
+        if entry.get("type") == "field"
+        and entry.get("name", "").lower() == name_lower
+        and entry.get("ems_system_id") == ems_system_id
+        and entry.get("database_id") == database_id
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    return None
 
 
 def _reset_result_store() -> None:
@@ -127,7 +185,14 @@ async def _resolve_field_id(
     if field_ref.startswith("["):
         return field_ref
 
-    # 3. Human-readable name -> search via API
+    # 3. Result store hit by name (scoped to this ems+db) -> avoid an API
+    # round-trip when the agent passes a name that was just returned by
+    # find_fields against the SAME database.
+    stored_id = _find_stored_field_by_name(field_ref, ems_system_id, database_id)
+    if stored_id is not None:
+        return stored_id
+
+    # 4. Human-readable name -> search via API
     cache_key = make_cache_key("field_resolve", ems_system_id, database_id, field_ref.lower())
     cached = await field_cache.get(cache_key)
     if cached is not None:
@@ -354,7 +419,11 @@ def _format_database_group(group: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _format_field_group(group: dict[str, Any]) -> str:
+def _format_field_group(
+    group: dict[str, Any],
+    ems_system_id: int | None = None,
+    database_id: str | None = None,
+) -> str:
     """Format field group response for display."""
     lines = []
 
@@ -370,7 +439,10 @@ def _format_field_group(group: dict[str, Any]) -> str:
             field_id = f.get("id", "?")
             field_name = f.get("name", "Unknown")
             field_type = f.get("type", "unknown")
-            ref = _store_result(field_name, field_id)
+            ref = _store_result(
+                field_name, field_id,
+                ems_system_id=ems_system_id, database_id=database_id,
+            )
             lines.append(f"  [{ref}] {field_name} ({field_type})")
 
     # Format subgroups
@@ -391,6 +463,8 @@ def _format_field_group(group: dict[str, Any]) -> str:
 def _format_field_search_results(
     fields: list[dict[str, Any]],
     show_ids: bool = False,
+    ems_system_id: int | None = None,
+    database_id: str | None = None,
 ) -> str:
     """Format field search results for display.
 
@@ -398,6 +472,9 @@ def _format_field_search_results(
         fields: List of field dicts from the API.
         show_ids: If True, show full IDs inline (backward compat).
             If False (default), assign numbered refs and hide IDs.
+        ems_system_id: EMS system the search ran against. Stored alongside
+            each reference so subsequent name lookups stay DB-scoped.
+        database_id: Database the search ran against.
     """
     if not fields:
         return "No fields found matching the search criteria."
@@ -408,6 +485,8 @@ def _format_field_search_results(
         field_name = f.get("name", "Unknown")
         field_type = f.get("type", "unknown")
         units = f.get("units")
+        description = f.get("description")
+        discrete_values = f.get("discreteValues")
 
         type_str = field_type
         if units:
@@ -417,8 +496,17 @@ def _format_field_search_results(
             lines.append(f"\n  {field_name} [{type_str}]")
             lines.append(f"    ID: {field_id}")
         else:
-            ref = _store_result(field_name, field_id)
+            ref = _store_result(
+                field_name, field_id,
+                ems_system_id=ems_system_id, database_id=database_id,
+            )
             lines.append(f"\n  [{ref}] {field_name} [{type_str}]")
+
+        if description:
+            lines.append(f"    {description}")
+
+        if discrete_values:
+            lines.extend(_format_inline_discrete_values(discrete_values))
 
     if not show_ids:
         lines.append(
@@ -426,6 +514,58 @@ def _format_field_search_results(
         )
 
     return "\n".join(lines)
+
+
+def _format_inline_discrete_values(
+    discrete_values: Any,
+    max_inline: int = 10,
+) -> list[str]:
+    """Format discrete value mappings for inline display in search results.
+
+    Shows up to ``max_inline`` values inline; if there are more, shows the
+    count and tells the agent how to retrieve them all.
+
+    Args:
+        discrete_values: Either a list of ``{"value": code, "label": label}``
+            dicts or a ``{"code": "label"}`` mapping.
+        max_inline: Maximum entries to show before truncating.
+
+    Returns:
+        Lines to append to the formatted output.
+    """
+    if isinstance(discrete_values, dict):
+        total = len(discrete_values)
+        if total == 0:
+            return []
+        lines = [f"    Discrete values ({total}):"]
+        from itertools import islice
+        for k, v in islice(discrete_values.items(), max_inline):
+            lines.append(f"      {k}: {v}")
+        if total > max_inline:
+            lines.append(
+                f"      ... and {total - max_inline} more "
+                f"(use get_field_info or include_field_info=True for the full list)"
+            )
+        return lines
+    elif isinstance(discrete_values, list):
+        values = discrete_values
+    else:
+        return []
+
+    if not values:
+        return []
+
+    lines = [f"    Discrete values ({len(values)}):"]
+    for dv in values[:max_inline]:
+        value = dv.get("value", "?") if isinstance(dv, dict) else "?"
+        label = dv.get("label", "Unknown") if isinstance(dv, dict) else str(dv)
+        lines.append(f"      {value}: {label}")
+    if len(values) > max_inline:
+        lines.append(
+            f"      ... and {len(values) - max_inline} more "
+            f"(use get_field_info or include_field_info=True for the full list)"
+        )
+    return lines
 
 
 def _format_field_info(field: dict[str, Any]) -> str:
@@ -472,6 +612,7 @@ def _format_field_info(field: dict[str, Any]) -> str:
 def _format_analytics_search_results(
     analytics: list[dict[str, Any]],
     show_ids: bool = False,
+    ems_system_id: int | None = None,
 ) -> str:
     """Format analytics search results for display.
 
@@ -479,6 +620,7 @@ def _format_analytics_search_results(
         analytics: List of analytic dicts from the API.
         show_ids: If True, show full IDs inline (backward compat).
             If False (default), assign numbered refs and hide IDs.
+        ems_system_id: EMS system the search ran against.
     """
     if not analytics:
         return "No analytics found matching the search criteria."
@@ -501,7 +643,10 @@ def _format_analytics_search_results(
                 lines.append(f"    {description}")
             lines.append(f"    ID: {analytic_id}")
         else:
-            ref = _store_result(analytic_name, analytic_id, result_type="analytic")
+            ref = _store_result(
+                analytic_name, analytic_id,
+                result_type="analytic", ems_system_id=ems_system_id,
+            )
             lines.append(f"\n  [{ref}] {analytic_name} [{type_str}]")
             if description:
                 lines.append(f"    {description}")
@@ -520,6 +665,8 @@ def _format_deep_search_results(
     groups_visited: int = 0,
     max_groups: int = 0,
     show_ids: bool = False,
+    ems_system_id: int | None = None,
+    database_id: str | None = None,
 ) -> str:
     """Format recursive field search results for display.
 
@@ -530,6 +677,8 @@ def _format_deep_search_results(
         max_groups: The max_groups budget that was configured.
         show_ids: If True, show full IDs inline (backward compat).
             If False (default), assign numbered refs and hide IDs.
+        ems_system_id: EMS system the search ran against.
+        database_id: Database the search ran against.
 
     Returns:
         Formatted search results string.
@@ -560,7 +709,10 @@ def _format_deep_search_results(
             lines.append(f"    Path: {path}")
             lines.append(f"    ID: {field_id}")
         else:
-            ref = _store_result(field_name, field_id)
+            ref = _store_result(
+                field_name, field_id,
+                ems_system_id=ems_system_id, database_id=database_id,
+            )
             lines.append(f"\n  [{ref}] {field_name} [{type_str}]")
             lines.append(f"    Path: {path}")
 
@@ -726,7 +878,7 @@ async def _do_browse_fields(
     cached = await field_cache.get(cache_key)
     if cached is not None:
         logger.debug("Using cached field group: %s", cache_key)
-        return _format_field_group(cached)
+        return _format_field_group(cached, ems_system_id, database_id)
 
     try:
         path = f"/api/v2/ems-systems/{ems_system_id}/databases/{database_id}/field-groups"
@@ -735,7 +887,7 @@ async def _do_browse_fields(
 
         group = await client.get(path)
         await field_cache.set(cache_key, group)
-        return _format_field_group(group)
+        return _format_field_group(group, ems_system_id, database_id)
     except EMSNotFoundError:
         return (
             f"Error: Field group not found. Verify database_id='{database_id}' is valid. "
@@ -752,12 +904,47 @@ async def _do_browse_fields(
         return f"Error listing fields: {e.message}"
 
 
+async def _fetch_field_search(
+    client: Any,
+    ems_system_id: int,
+    database_id: str,
+    search_text: str,
+) -> list[dict[str, Any]]:
+    """Fetch field-search results, hitting the cache first.
+
+    Caches the full unbounded result list keyed on the lowercased search
+    term so callers can apply their own ``max_results`` slice without
+    invalidating the cache.
+
+    Args:
+        client: The EMS API client.
+        ems_system_id: The EMS system ID.
+        database_id: The opaque database ID.
+        search_text: The keyword to search for.
+
+    Returns:
+        The list of field dicts returned by the API.
+    """
+    cache_key = make_cache_key("field_search", ems_system_id, database_id, search_text.lower())
+    cached = await field_cache.get(cache_key)
+    if cached is not None:
+        logger.debug("Using cached field search: %s", cache_key)
+        cached_list: list[dict[str, Any]] = cached
+        return cached_list
+
+    path = f"/api/v2/ems-systems/{ems_system_id}/databases/{database_id}/fields"
+    fields: list[dict[str, Any]] = await client.get(path, params={"text": search_text})
+    await field_cache.set(cache_key, fields)
+    return fields
+
+
 async def _do_search_fields(
     ems_system_id: int,
     database_id: str,
     search_text: str,
     max_results: int,
     show_ids: bool,
+    include_field_info: bool = False,
 ) -> str:
     """Search mode: keyword search via the field search API endpoint.
 
@@ -767,6 +954,9 @@ async def _do_search_fields(
         search_text: Text to search for.
         max_results: Maximum results.
         show_ids: Show full IDs inline.
+        include_field_info: If True, fan out get_field_info for each result
+            in parallel and merge details (description, discreteValues) into
+            the formatter input.
 
     Returns:
         Formatted search results.
@@ -787,18 +977,8 @@ async def _do_search_fields(
 
     client = get_client()
 
-    cache_key = make_cache_key("field_search", ems_system_id, database_id, search_text.lower())
-    cached = await field_cache.get(cache_key)
-    if cached is not None:
-        logger.debug("Using cached field search: %s", cache_key)
-        return _format_field_search_results(cached[:max_results], show_ids=show_ids)
-
     try:
-        path = f"/api/v2/ems-systems/{ems_system_id}/databases/{database_id}/fields"
-        params = {"text": search_text}
-        fields = await client.get(path, params=params)
-        await field_cache.set(cache_key, fields)
-        return _format_field_search_results(fields[:max_results], show_ids=show_ids)
+        fields = await _fetch_field_search(client, ems_system_id, database_id, search_text)
     except EMSNotFoundError:
         return (
             f"Error: Database not found. Verify database_id='{database_id}' is valid. "
@@ -814,6 +994,184 @@ async def _do_search_fields(
                 "or use list_databases to verify the database ID."
             )
         return f"Error searching fields: {e.message}"
+
+    sliced = fields[:max_results]
+    if include_field_info:
+        sliced = await _enrich_with_field_info(client, ems_system_id, database_id, sliced)
+    return _format_field_search_results(
+        sliced, show_ids=show_ids,
+        ems_system_id=ems_system_id, database_id=database_id,
+    )
+
+
+async def _do_search_fields_multi(
+    ems_system_id: int,
+    database_id: str,
+    search_terms: list[str],
+    max_results: int,
+    show_ids: bool,
+    include_field_info: bool = False,
+) -> str:
+    """Search mode: run multiple keyword searches concurrently.
+
+    Each term hits its own cache entry so that subsequent single-term
+    calls still hit cache. Results are grouped by term in the output.
+
+    Args:
+        ems_system_id: The EMS system ID.
+        database_id: Database ID.
+        search_terms: Non-empty list of keywords.
+        max_results: Maximum results per term.
+        show_ids: Show full IDs inline.
+        include_field_info: If True, fan out get_field_info for each
+            result in parallel and merge details into the formatter input.
+
+    Returns:
+        Formatted search results, one block per term.
+    """
+    if "[entity-type-group]" in database_id:
+        return (
+            "Error: This appears to be a database GROUP ID, not a database ID. "
+            "Use list_databases with this as group_id to navigate deeper and find "
+            "actual database IDs."
+        )
+
+    if _is_entity_type_database(database_id):
+        return (
+            f"Error: database_id='{database_id}' is an entity-type database, which does "
+            "not support the field search endpoint. Use find_fields with mode='deep' "
+            "for BFS traversal, or mode='browse' to navigate field groups."
+        )
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for term in search_terms:
+        if not isinstance(term, str):
+            continue
+        stripped = term.strip()
+        if not stripped:
+            continue
+        key = stripped.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(stripped)
+
+    if not cleaned:
+        return "Error: search_text list contained no usable search terms."
+
+    client = get_client()
+
+    sem = asyncio.Semaphore(_MAX_CONCURRENT_FIELD_REQUESTS)
+
+    async def _bounded_fetch(term: str) -> Any:
+        async with sem:
+            return await _fetch_field_search(client, ems_system_id, database_id, term)
+
+    results = await asyncio.gather(
+        *(_bounded_fetch(term) for term in cleaned),
+        return_exceptions=True,
+    )
+
+    blocks: list[str] = []
+    for term, outcome in zip(cleaned, results, strict=True):
+        block_lines = [f'Search: "{term}"']
+
+        if isinstance(outcome, EMSNotFoundError):
+            block_lines.append(
+                f"  Error: Database not found. Verify database_id='{database_id}'."
+            )
+            blocks.append("\n".join(block_lines))
+            continue
+        if isinstance(outcome, EMSAPIError):
+            if outcome.status_code == 405:
+                block_lines.append(
+                    "  Error: HTTP 405 Method Not Allowed. "
+                    "Try mode='deep' or mode='browse'."
+                )
+            else:
+                block_lines.append(f"  Error: {outcome.message}")
+            blocks.append("\n".join(block_lines))
+            continue
+        if isinstance(outcome, BaseException):
+            block_lines.append(f"  Error: {outcome}")
+            blocks.append("\n".join(block_lines))
+            continue
+
+        sliced = outcome[:max_results]
+        if include_field_info:
+            sliced = await _enrich_with_field_info(
+                client, ems_system_id, database_id, sliced
+            )
+        block_lines.append(
+            _format_field_search_results(
+                sliced, show_ids=show_ids,
+                ems_system_id=ems_system_id, database_id=database_id,
+            )
+        )
+        blocks.append("\n".join(block_lines))
+
+    header = (
+        f"Multi-term search across {len(cleaned)} term(s) "
+        f"in database '{database_id}':\n"
+    )
+    return header + "\n\n".join(blocks)
+
+
+async def _enrich_with_field_info(
+    client: Any,
+    ems_system_id: int,
+    database_id: str,
+    fields: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Fan out get_field_info for each field and merge results.
+
+    Each ``get_field_info`` call is independently cached, so repeated
+    enrichment is free.
+
+    Args:
+        client: The EMS API client.
+        ems_system_id: The EMS system ID.
+        database_id: The opaque database ID.
+        fields: The field dicts to enrich. Each must have an ``id`` key.
+
+    Returns:
+        A new list of field dicts with ``description`` and ``discreteValues``
+        merged in where available.
+    """
+    if not fields:
+        return fields
+
+    sem = asyncio.Semaphore(_MAX_CONCURRENT_FIELD_REQUESTS)
+
+    async def _fetch_one(field: dict[str, Any]) -> dict[str, Any]:
+        field_id = field.get("id", "")
+        if not field_id:
+            return field
+
+        async with sem:
+            cache_key = make_cache_key("field_info", ems_system_id, database_id, field_id)
+            info = await field_cache.get(cache_key)
+            if info is None:
+                try:
+                    encoded = urllib.parse.quote(field_id, safe="")
+                    path = (
+                        f"/api/v2/ems-systems/{ems_system_id}/databases/"
+                        f"{database_id}/fields/{encoded}"
+                    )
+                    info = await client.get(path)
+                    await field_cache.set(cache_key, info)
+                except (EMSAPIError, EMSNotFoundError):
+                    return field
+
+        merged = dict(field)
+        if "description" in info and "description" not in merged:
+            merged["description"] = info["description"]
+        if "discreteValues" in info and "discreteValues" not in merged:
+            merged["discreteValues"] = info["discreteValues"]
+        return merged
+
+    return list(await asyncio.gather(*(_fetch_one(f) for f in fields)))
 
 
 async def _do_deep_search_fields(
@@ -863,6 +1221,7 @@ async def _do_deep_search_fields(
         return _format_deep_search_results(
             results, search_text.strip(), groups_visited, max_groups,
             show_ids=show_ids,
+            ems_system_id=ems_system_id, database_id=database_id,
         )
     except EMSNotFoundError:
         return (
@@ -937,12 +1296,13 @@ async def find_fields(
     ems_system_id: int,
     database_id: str,
     mode: Literal["search", "browse", "deep"] = "search",
-    search_text: str | None = None,
+    search_text: str | list[str] | None = None,
     group_id: str | None = None,
     max_results: int = 50,
     max_depth: int = 5,
     max_groups: int = 50,
     show_ids: bool = False,
+    include_field_info: bool = False,
 ) -> str:
     """Find fields in a database. Three modes available:
 
@@ -955,16 +1315,26 @@ async def find_fields(
     Results show numbered references [N] that can be used directly in
     query_database, get_field_info, etc. Field names also work.
 
+    Pass a list to search_text to run multiple keyword searches in parallel
+    (e.g. ["fuel burn", "tail number", "takeoff airport"]) -- this collapses
+    N round-trips into one tool call. Each term is cached individually.
+
     Args:
         ems_system_id: EMS system ID.
         database_id: Database ID or name (e.g. "FDW Flights").
         mode: "search" (fast keyword), "browse" (navigate groups), or "deep" (BFS).
-        search_text: Search keyword (required for search and deep modes).
+        search_text: Search keyword, or a list of keywords for parallel
+            multi-term search. Required for search and deep modes.
+            Multi-term lists are only supported in search mode.
         group_id: Field group ID to navigate into (browse mode only).
-        max_results: Maximum results (search/deep modes, default: 50).
+        max_results: Maximum results per term (search/deep modes, default: 50).
         max_depth: Maximum traversal depth (deep mode, default: 5, max: 10).
         max_groups: Maximum API calls (deep mode, default: 50, max: 200).
         show_ids: If True, show full IDs inline instead of numbered references.
+        include_field_info: If True (search mode only), fetch full field
+            metadata in parallel for every result so descriptions and
+            discrete-value mappings appear inline. Eliminates a follow-up
+            get_field_info call per discrete field.
 
     Returns:
         Fields with names, types, and IDs (or numbered references).
@@ -976,10 +1346,25 @@ async def find_fields(
         return f"Error resolving database: {e}"
 
     if mode == "browse":
+        if include_field_info:
+            return (
+                "Error: include_field_info is only supported in search mode. "
+                "Use get_field_info on individual fields after browsing."
+            )
         return await _do_browse_fields(ems_system_id, database_id, group_id)
     elif mode == "deep":
+        if include_field_info:
+            return (
+                "Error: include_field_info is only supported in search mode. "
+                "Use get_field_info on individual fields after deep search."
+            )
         if not search_text:
             return "Error: search_text is required for deep mode."
+        if isinstance(search_text, list):
+            return (
+                "Error: deep mode does not support multi-term search. "
+                "Pass a single string to search_text, or call again per term."
+            )
         return await _do_deep_search_fields(
             ems_system_id, database_id, search_text,
             max_results, max_depth, max_groups, show_ids,
@@ -987,8 +1372,14 @@ async def find_fields(
     else:  # mode == "search" (default)
         if not search_text:
             return "Error: search_text is required for search mode."
+        if isinstance(search_text, list):
+            return await _do_search_fields_multi(
+                ems_system_id, database_id, search_text,
+                max_results, show_ids, include_field_info,
+            )
         return await _do_search_fields(
-            ems_system_id, database_id, search_text, max_results, show_ids,
+            ems_system_id, database_id, search_text,
+            max_results, show_ids, include_field_info,
         )
 
 
@@ -1082,7 +1473,10 @@ async def search_analytics(
     cached = await field_cache.get(cache_key)
     if cached is not None:
         logger.debug("Using cached analytics search: %s", cache_key)
-        return _format_analytics_search_results(cached[:max_results], show_ids=show_ids)
+        return _format_analytics_search_results(
+            cached[:max_results], show_ids=show_ids,
+            ems_system_id=ems_system_id,
+        )
 
     try:
         path = f"/api/v2/ems-systems/{ems_system_id}/analytics"
@@ -1092,7 +1486,10 @@ async def search_analytics(
 
         analytics = await client.get(path, params=params)
         await field_cache.set(cache_key, analytics)
-        return _format_analytics_search_results(analytics[:max_results], show_ids=show_ids)
+        return _format_analytics_search_results(
+            analytics[:max_results], show_ids=show_ids,
+            ems_system_id=ems_system_id,
+        )
     except EMSNotFoundError:
         return f"Error: EMS system {ems_system_id} not found. Use list_ems_systems to find valid system IDs."
     except EMSAPIError as e:
