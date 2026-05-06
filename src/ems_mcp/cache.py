@@ -235,7 +235,6 @@ class SQLiteCache(Generic[T]):
         self._db_path = Path(db_path)
         self._namespace = namespace
         self._default_ttl = default_ttl
-        self._write_count = 0
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
@@ -308,14 +307,13 @@ class SQLiteCache(Generic[T]):
                 "VALUES (?, ?, ?, ?, ?)",
                 (self._namespace, key, blob, expires_at, now),
             )
-            # Prune expired rows periodically (every ~50 writes, lightweight).
-            # This prevents unbounded growth from long-lived persistent caches.
-            self._write_count += 1
-            if self._write_count >= self._PRUNE_EVERY:
+            # Probabilistic pruning (~1 in 50 writes). Thread-safe without
+            # shared mutable state since each call decides independently.
+            import random
+            if random.random() < 1.0 / self._PRUNE_EVERY:
                 conn.execute(
                     "DELETE FROM cache_entries WHERE expires_at <= ?", (now,)
                 )
-                self._write_count = 0
             conn.commit()
 
     def _delete_sync(self, key: str) -> bool:
