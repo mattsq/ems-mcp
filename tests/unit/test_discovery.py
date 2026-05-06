@@ -139,8 +139,10 @@ class TestFormatters:
         assert "Fields (2):" in result
         assert "Flight Date (datetime)" in result
         assert "Duration (number)" in result
-        assert "Identification (ID: identification)" in result
-        # Fields now use numbered references instead of showing raw IDs
+        # Subgroups now use numbered [N] refs instead of raw IDs.
+        assert "Identification" in result
+        assert "identification" not in result.split("Identification", 1)[1].split("\n", 1)[0]
+        # Fields use numbered references too.
         assert "[0]" in result or "[" in result
 
     def test_format_field_group_uses_numbered_refs(self) -> None:
@@ -161,6 +163,35 @@ class TestFormatters:
         ref_entry = _get_stored_result(0)
         assert ref_entry is not None
         assert ref_entry["id"] == long_id
+
+    def test_format_field_group_subgroups_use_numbered_refs(self) -> None:
+        """Subgroups should also use numbered [N] references and not show
+        raw bracket-encoded IDs inline -- copying long group IDs between
+        browse calls is a major friction point."""
+        _reset_result_store()
+        long_group_id = (
+            "[-hub-][field-group][[[ems-core][entity-type][foqa-flights]]"
+            "[[ems-dal-fdwflightconstantsfromodw][internal-field-group][a635ca72-f2c4-48bd-887e-769ca8babf99]]]"
+        )
+        group = {
+            "id": "[none]",
+            "name": "Operational Information",
+            "fields": [],
+            "groups": [
+                {"id": long_group_id, "name": "Fuel"},
+            ],
+        }
+        result = _format_field_group(group, ems_system_id=1, database_id="db")
+        # Long ID should not appear inline; numbered ref should be used.
+        assert long_group_id not in result
+        assert "[0] Fuel" in result
+        # Hint about how to drill should be present.
+        assert "find_fields" in result
+        # The stored result should be retrievable as a group entry.
+        entry = _get_stored_result(0)
+        assert entry is not None
+        assert entry["type"] == "group"
+        assert entry["id"] == long_group_id
 
     def test_format_field_search_results_empty(self) -> None:
         """Format empty search results."""
@@ -248,6 +279,30 @@ class TestFormatters:
         result = _format_field_search_results(fields, show_ids=True)
         assert "ID: f1" in result
         assert "get_result_id" not in result
+
+    def test_format_field_search_results_discloses_truncation(self) -> None:
+        """When total_available exceeds the displayed slice, the header
+        should announce the total and tell the agent how to see the rest."""
+        fields = [
+            {"id": f"f{i}", "name": f"Field {i}", "type": "string"}
+            for i in range(5)
+        ]
+        result = _format_field_search_results(fields, total_available=42)
+        assert "Found 42 field(s)" in result
+        assert "showing first 5" in result
+        assert "max_results=42" in result
+
+    def test_format_field_search_results_no_disclosure_when_full(self) -> None:
+        """When total_available equals the displayed count, no truncation
+        notice should appear -- agents shouldn't be told "more available"
+        when there isn't more."""
+        fields = [
+            {"id": "f1", "name": "Altitude", "type": "number"},
+            {"id": "f2", "name": "Airspeed", "type": "number"},
+        ]
+        result = _format_field_search_results(fields, total_available=2)
+        assert "Found 2 field(s):" in result
+        assert "showing first" not in result
 
     def test_format_field_info_basic(self) -> None:
         """Format basic field info."""
@@ -528,6 +583,81 @@ class TestFindFieldsBrowse:
         assert "Tail Number" in result
 
     @pytest.mark.asyncio
+    async def test_browse_drilldown_via_numbered_ref(self) -> None:
+        """End-to-end: browse the root, then call again with the [N] ref of a
+        subgroup as group_id. The resolver should expand it back to the
+        opaque group ID without the agent having to copy the long string.
+        """
+        _reset_result_store()
+
+        mock_client = MagicMock()
+
+        long_group_id = (
+            "[-hub-][field-group][[[a]][[b]][[deep-fuel-group-id]]]"
+        )
+
+        captured_paths: list[str] = []
+
+        def mock_get(path: str, **kwargs: Any) -> Any:
+            captured_paths.append(path)
+            if "groupId=" not in path:
+                return {
+                    "id": "[none]", "name": "Root",
+                    "fields": [],
+                    "groups": [{"id": long_group_id, "name": "Fuel"}],
+                }
+            return {
+                "id": long_group_id, "name": "Fuel",
+                "fields": [{"id": "f1", "name": "Best Touchdown Fuel Quantity", "type": "number"}],
+                "groups": [],
+            }
+
+        mock_client.get = AsyncMock(side_effect=mock_get)
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            # First call lists root and assigns [0] to the Fuel subgroup.
+            await _find_fields(
+                ems_system_id=1, database_id="[ems-core]", mode="browse",
+            )
+            # Second call passes the numbered ref; should resolve to the long ID.
+            result = await _find_fields(
+                ems_system_id=1, database_id="[ems-core]",
+                mode="browse", group_id=0,
+            )
+
+        assert "Best Touchdown Fuel Quantity" in result
+        # The second API call must have used the resolved long group ID.
+        drill_paths = [p for p in captured_paths if "groupId=" in p]
+        assert drill_paths
+        assert long_group_id in drill_paths[-1]
+
+    @pytest.mark.asyncio
+    async def test_browse_unknown_numbered_ref_errors_clearly(self) -> None:
+        """Passing a numbered ref that's not in the store should surface a
+        clear error rather than silently calling the API with a bad ID."""
+        _reset_result_store()
+        result = await _find_fields(
+            ems_system_id=1, database_id="[ems-core]",
+            mode="browse", group_id=999,
+        )
+        assert "Error" in result
+        assert "999" in result
+
+    @pytest.mark.asyncio
+    async def test_browse_field_ref_as_group_id_errors(self) -> None:
+        """Passing a field [N] where a group is expected should fail loudly
+        rather than calling the API with a non-group ID."""
+        _reset_result_store()
+        from ems_mcp.tools.discovery import _store_result
+        ref = _store_result("Altitude", "[fld][alt]", result_type="field")
+        result = await _find_fields(
+            ems_system_id=1, database_id="[ems-core]",
+            mode="browse", group_id=ref,
+        )
+        assert "Error" in result
+        assert "not a field group" in result
+
+    @pytest.mark.asyncio
     async def test_browse_fields_rejects_entity_type_group_id(self) -> None:
         """Tool should reject database IDs that are actually group IDs."""
         result = await _find_fields(
@@ -631,7 +761,10 @@ class TestFindFieldsSearch:
                 max_results=10,
             )
 
-        assert "Found 10 field(s):" in result
+        # Truncation should be disclosed: agent needs to know more matches exist.
+        assert "Found 100 field(s)" in result
+        assert "showing first 10" in result
+        assert "max_results=100" in result
 
     @pytest.mark.asyncio
     async def test_search_fields_uses_cache(self) -> None:
@@ -1215,6 +1348,36 @@ class TestFormatDeepSearchResults:
         assert "Budget exhausted" in result
         assert "max_groups" in result
 
+    def test_result_cap_hit_announces_more_available(self) -> None:
+        """When BFS stopped at max_results, the header should signal that
+        more matches may exist so the agent raises max_results rather
+        than pivoting keywords."""
+        _reset_result_store()
+        results = [
+            {"name": f"Fuel {i}", "id": f"f{i}", "type": "number",
+             "units": "kg", "path": "X"}
+            for i in range(5)
+        ]
+        result = _format_deep_search_results(
+            results, "fuel", groups_visited=10, max_groups=50,
+            result_cap_hit=True,
+        )
+        assert "result cap reached" in result
+        assert "max_results" in result
+
+    def test_result_cap_not_hit_no_warning(self) -> None:
+        """When the result cap was not hit, no "more matches" warning."""
+        _reset_result_store()
+        results = [
+            {"name": "Fuel A", "id": "f1", "type": "number",
+             "units": "kg", "path": "X"},
+        ]
+        result = _format_deep_search_results(
+            results, "fuel", groups_visited=10, max_groups=50,
+            result_cap_hit=False,
+        )
+        assert "result cap reached" not in result
+
 
 class TestRecursiveFieldSearch:
     """Tests for _recursive_field_search helper."""
@@ -1441,6 +1604,217 @@ class TestRecursiveFieldSearch:
         assert results[0]["name"] == "Flight Number"
         # "Flight Information" should have been visited before "Other Stuff"
         assert visit_order.index("flight") < visit_order.index("other")
+
+    @pytest.mark.asyncio
+    async def test_path_token_disambiguates_field_name(self) -> None:
+        """A query token absent from the field name but present in the path
+        should still match -- e.g. "fuel landing" finds a "Touchdown Fuel
+        Quantity" field whose breadcrumb is "...Fuel > ...Landing > Reported".
+        """
+        mock_client = MagicMock()
+
+        def mock_get(path: str, **kwargs: Any) -> Any:
+            if "groupId=fuel" in path:
+                return {
+                    "id": "fuel", "name": "Fuel",
+                    "fields": [],
+                    "groups": [{"id": "land", "name": "Descent and Landing"}],
+                }
+            if "groupId=land" in path:
+                return {
+                    "id": "land", "name": "Descent and Landing",
+                    "fields": [
+                        # Field name has "Fuel" but not "Landing"; the path
+                        # provides the disambiguating token.
+                        {"id": "f1", "name": "Best Touchdown (On) Fuel Quantity (kg)", "type": "number"},
+                    ],
+                    "groups": [],
+                }
+            return {
+                "id": "[none]", "name": "Root",
+                "fields": [],
+                "groups": [{"id": "fuel", "name": "Fuel"}],
+            }
+
+        mock_client.get = AsyncMock(side_effect=mock_get)
+
+        results, _ = await _recursive_field_search(
+            mock_client, 1, "db", "fuel landing",
+            max_depth=5, max_results=10, max_groups=50,
+        )
+        assert len(results) == 1
+        assert results[0]["name"] == "Best Touchdown (On) Fuel Quantity (kg)"
+        assert "Landing" in results[0]["path"]
+
+    @pytest.mark.asyncio
+    async def test_stop_words_in_query_are_ignored(self) -> None:
+        """Stop words like 'at', 'on', 'of' should not be required to match,
+        so "fuel quantity at landing" still finds the touchdown-fuel field.
+        """
+        mock_client = MagicMock()
+
+        def mock_get(path: str, **kwargs: Any) -> Any:
+            if "groupId=land" in path:
+                return {
+                    "id": "land", "name": "Landing",
+                    "fields": [
+                        {"id": "f1", "name": "Best Touchdown Fuel Quantity (kg)", "type": "number"},
+                    ],
+                    "groups": [],
+                }
+            return {
+                "id": "[none]", "name": "Root",
+                "fields": [],
+                "groups": [{"id": "land", "name": "Landing"}],
+            }
+
+        mock_client.get = AsyncMock(side_effect=mock_get)
+
+        results, _ = await _recursive_field_search(
+            mock_client, 1, "db", "fuel quantity at landing",
+            max_depth=5, max_results=10, max_groups=50,
+        )
+        assert len(results) == 1
+        assert results[0]["name"] == "Best Touchdown Fuel Quantity (kg)"
+
+    @pytest.mark.asyncio
+    async def test_token_and_rejects_partial_match(self) -> None:
+        """All non-stop-word tokens must appear (in name or path). A field
+        that matches only one token but not the other should not be returned.
+        """
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value={
+            "id": "[none]", "name": "Root",
+            "fields": [
+                # Has "fuel" but no "landing" anywhere -- must NOT match "fuel landing".
+                {"id": "f1", "name": "Discretionary Fuel (kg)", "type": "number"},
+                # Has both tokens via name -- should match.
+                {"id": "f2", "name": "Landing Fuel Stack", "type": "number"},
+            ],
+            "groups": [],
+        })
+
+        results, _ = await _recursive_field_search(
+            mock_client, 1, "db", "fuel landing",
+            max_depth=5, max_results=10, max_groups=50,
+        )
+        names = {r["name"] for r in results}
+        assert "Landing Fuel Stack" in names
+        assert "Discretionary Fuel (kg)" not in names
+
+    @pytest.mark.asyncio
+    async def test_pure_stopword_query_falls_back_to_substring(self) -> None:
+        """A query that's only stop words / punctuation (e.g. '(kg)') should
+        fall back to plain substring match so users can still find literal
+        fragments.
+        """
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value={
+            "id": "[none]", "name": "Root",
+            "fields": [
+                {"id": "f1", "name": "Fuel Quantity (kg)", "type": "number"},
+                {"id": "f2", "name": "Distance (nm)", "type": "number"},
+            ],
+            "groups": [],
+        })
+
+        results, _ = await _recursive_field_search(
+            mock_client, 1, "db", "(kg)",
+            max_depth=5, max_results=10, max_groups=50,
+        )
+        names = {r["name"] for r in results}
+        assert "Fuel Quantity (kg)" in names
+        assert "Distance (nm)" not in names
+
+
+class TestFieldMatchesQuery:
+    """Tests for the _field_matches_query helper (path-aware token matching)."""
+
+    def test_single_token_substring(self) -> None:
+        from ems_mcp.tools.discovery import _field_matches_query
+        assert _field_matches_query("Fuel Quantity", "", "fuel")
+        assert not _field_matches_query("Distance", "", "fuel")
+
+    def test_token_in_path_only(self) -> None:
+        from ems_mcp.tools.discovery import _field_matches_query
+        assert _field_matches_query(
+            "Best Touchdown Fuel Quantity",
+            "Operational Information > Fuel > Landing > Reported",
+            "fuel landing",
+        )
+
+    def test_token_not_in_either(self) -> None:
+        from ems_mcp.tools.discovery import _field_matches_query
+        assert not _field_matches_query(
+            "Discretionary Fuel",
+            "Operational > Economy",
+            "fuel landing",
+        )
+
+    def test_stop_words_dropped(self) -> None:
+        from ems_mcp.tools.discovery import _field_matches_query
+        assert _field_matches_query(
+            "Best Touchdown Fuel Quantity",
+            "Landing > Reported",
+            "fuel quantity at landing",
+        )
+
+    def test_pure_stopword_query_uses_substring(self) -> None:
+        from ems_mcp.tools.discovery import _field_matches_query
+        assert _field_matches_query("Fuel Quantity (kg)", "", "(kg)")
+        assert not _field_matches_query("Distance (nm)", "", "(kg)")
+
+    def test_case_insensitive(self) -> None:
+        from ems_mcp.tools.discovery import _field_matches_query
+        assert _field_matches_query("FUEL BURNED", "", "fuel burned")
+        assert _field_matches_query("Fuel Burned", "Operational > FUEL", "burned fuel")
+
+
+class TestResolveGroupIdRef:
+    """Tests for the _resolve_group_id_ref helper used by browse mode."""
+
+    def setup_method(self) -> None:
+        _reset_result_store()
+
+    def test_none_passes_through(self) -> None:
+        from ems_mcp.tools.discovery import _resolve_group_id_ref
+        assert _resolve_group_id_ref(None) is None
+
+    def test_int_lookup(self) -> None:
+        from ems_mcp.tools.discovery import _resolve_group_id_ref, _store_result
+        ref = _store_result("Fuel", "[grp][fuel]", result_type="group")
+        assert _resolve_group_id_ref(ref) == "[grp][fuel]"
+
+    def test_digit_string_lookup(self) -> None:
+        from ems_mcp.tools.discovery import _resolve_group_id_ref, _store_result
+        ref = _store_result("Fuel", "[grp][fuel]", result_type="group")
+        assert _resolve_group_id_ref(str(ref)) == "[grp][fuel]"
+
+    def test_bracketed_digit_form_lookup(self) -> None:
+        """Agents may copy "[N]" verbatim from the formatter output;
+        we should accept that form too."""
+        from ems_mcp.tools.discovery import _resolve_group_id_ref, _store_result
+        ref = _store_result("Fuel", "[grp][fuel]", result_type="group")
+        assert _resolve_group_id_ref(f"[{ref}]") == "[grp][fuel]"
+
+    def test_raw_bracket_id_passes_through(self) -> None:
+        """A raw bracket-encoded group ID (not a numeric ref) should be
+        returned unchanged so legacy callers keep working."""
+        from ems_mcp.tools.discovery import _resolve_group_id_ref
+        raw = "[-hub-][field-group][[[a]][[b]]]"
+        assert _resolve_group_id_ref(raw) == raw
+
+    def test_unknown_ref_raises(self) -> None:
+        from ems_mcp.tools.discovery import _resolve_group_id_ref
+        with pytest.raises(ValueError, match="not found in result store"):
+            _resolve_group_id_ref(999)
+
+    def test_field_ref_raises(self) -> None:
+        """Passing a field [N] where a group is expected should fail loudly."""
+        from ems_mcp.tools.discovery import _resolve_group_id_ref, _store_result
+        ref = _store_result("Altitude", "[fld][alt]", result_type="field")
+        with pytest.raises(ValueError, match="not a field group"):
+            _resolve_group_id_ref(ref)
 
 
 class TestFindFieldsDeep:
