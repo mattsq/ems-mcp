@@ -49,7 +49,15 @@ def get_verify_setting() -> ssl.SSLContext | bool:
             continue
         path = Path(value)
         if path.is_file():
-            return ssl.create_default_context(cafile=value)
+            ctx = ssl.create_default_context(cafile=value)
+            # Corporate proxy bundles (e.g. Zscaler) often contain a CA whose
+            # basicConstraints extension is not marked critical. Python 3.10+
+            # enables VERIFY_X509_STRICT by default, which rejects such certs
+            # with "Basic Constraints of CA cert not marked critical". Relax
+            # only when a custom bundle is in use; the system trust store
+            # path below keeps strict validation.
+            ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
+            return ctx
         # Path is set but doesn't exist.
         if env_var == "EMS_CA_BUNDLE":
             raise FileNotFoundError(
