@@ -534,7 +534,19 @@ def _format_inline_discrete_values(
         Lines to append to the formatted output.
     """
     if isinstance(discrete_values, dict):
-        values = [{"value": k, "label": v} for k, v in discrete_values.items()]
+        total = len(discrete_values)
+        if total == 0:
+            return []
+        lines = [f"    Discrete values ({total}):"]
+        from itertools import islice
+        for k, v in islice(discrete_values.items(), max_inline):
+            lines.append(f"      {k}: {v}")
+        if total > max_inline:
+            lines.append(
+                f"      ... and {total - max_inline} more "
+                f"(use get_field_info or include_field_info=True for the full list)"
+            )
+        return lines
     elif isinstance(discrete_values, list):
         values = discrete_values
     else:
@@ -1334,8 +1346,18 @@ async def find_fields(
         return f"Error resolving database: {e}"
 
     if mode == "browse":
+        if include_field_info:
+            return (
+                "Error: include_field_info is only supported in search mode. "
+                "Use get_field_info on individual fields after browsing."
+            )
         return await _do_browse_fields(ems_system_id, database_id, group_id)
     elif mode == "deep":
+        if include_field_info:
+            return (
+                "Error: include_field_info is only supported in search mode. "
+                "Use get_field_info on individual fields after deep search."
+            )
         if not search_text:
             return "Error: search_text is required for deep mode."
         if isinstance(search_text, list):

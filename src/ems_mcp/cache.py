@@ -1,13 +1,14 @@
-"""In-memory caching infrastructure for EMS MCP server.
+"""In-memory and persistent caching infrastructure for EMS MCP server.
 
 Provides simple async-safe caching with TTL support for reducing
 redundant API calls. Field IDs and database metadata are stable
 and benefit from caching.
 
-When ``EMS_CACHE_DIR`` is set, the field cache is backed by a SQLite
-database in that directory so its contents survive server restarts.
-Field IDs are stable for hours/days, so warm cache hits across sessions
-significantly reduce first-call latency.
+When ``EMS_CACHE_DIR`` is set, the **field cache** is backed by a SQLite
+database in that directory so field discovery results survive server
+restarts. Field IDs are stable for hours/days, so warm cache hits across
+sessions significantly reduce first-call latency. Database and asset
+caches remain in-memory only (cheap to re-fetch, more volatile).
 """
 
 import asyncio
@@ -187,9 +188,13 @@ class SQLiteCache(Generic[T]):
     Concurrency model: each operation opens its own ``sqlite3.Connection`` and
     SQLite is run in WAL mode, so reads can proceed in parallel and writes
     serialise at the SQL layer via ``INSERT OR REPLACE``. Async operations
-    (``get``/``set``/``delete``/``clear``/``size``) dispatch their blocking
-    SQLite call through ``asyncio.to_thread`` and hold no asyncio lock, so
-    the cache does not bottleneck callers that fan out concurrent requests.
+    (``get``/``set``/``delete``/``clear``) dispatch their blocking SQLite call
+    through ``asyncio.to_thread`` and hold no asyncio lock, so the cache does
+    not bottleneck callers that fan out concurrent requests.
+
+    The ``size`` property is intentionally synchronous (matching the
+    ``SimpleCache`` API) since it executes a fast COUNT query and is only used
+    in diagnostic/test contexts.
 
     Construction (``__init__``) is intentionally synchronous: it creates the
     cache directory, opens a connection, and runs schema migration. This is a
@@ -348,8 +353,10 @@ class SQLiteCache(Generic[T]):
     async def clear(self) -> None:
         await asyncio.to_thread(self._clear_sync)
 
-    async def size(self) -> int:
-        return await asyncio.to_thread(self._size_sync)
+    @property
+    def size(self) -> int:
+        """Current number of entries (synchronous, consistent with SimpleCache API)."""
+        return self._size_sync()
 
 
 def _build_field_cache() -> "SimpleCache[Any] | SQLiteCache[Any]":
@@ -388,6 +395,9 @@ def _build_field_cache() -> "SimpleCache[Any] | SQLiteCache[Any]":
 
 # Global cache instances for different data types
 field_cache: SimpleCache[Any] | SQLiteCache[Any] = _build_field_cache()
+# database_cache and asset_cache are intentionally in-memory only: database
+# group structures and asset lists are small, change more frequently than
+# field IDs, and are cheap to re-fetch on server restart.
 database_cache: SimpleCache[Any] = SimpleCache(default_ttl=3600)
 asset_cache: SimpleCache[Any] = SimpleCache(default_ttl=3600)
 
