@@ -7,9 +7,47 @@ opaque strings that cannot be constructed manually.
 
 import asyncio
 import logging
+import re
 import urllib.parse
 from collections import deque
 from typing import Any, Literal
+
+# Stop words skipped during tokenized matching. Kept small on purpose:
+# we only filter words that are too generic to disambiguate field names
+# (prepositions, articles). Domain-specific terms stay.
+_QUERY_STOP_WORDS: frozenset[str] = frozenset({
+    "a", "an", "and", "at", "for", "in", "of", "on", "or", "the", "to", "with",
+})
+
+
+def _tokenize_query(query: str) -> list[str]:
+    """Split a query into lowercase alphanumeric tokens, dropping stop words.
+
+    Returns an empty list for queries that consist entirely of stop words
+    or punctuation; callers should fall back to plain substring match in
+    that case to preserve the user's literal intent.
+    """
+    raw = [t for t in re.split(r"\W+", query.lower()) if t]
+    return [t for t in raw if t not in _QUERY_STOP_WORDS]
+
+
+def _field_matches_query(field_name: str, path: str, query: str) -> bool:
+    """Return True if every meaningful query token appears in name or path.
+
+    Match is case-insensitive substring per token across
+    ``field_name + " " + path``. This lets queries like "fuel landing"
+    find "Best Touchdown (On) Fuel Quantity" when its path contains
+    "...Descent and Landing > Landing > Reported > Metric".
+
+    If the query is entirely stop words / punctuation, falls back to a
+    plain substring match on the original query so callers can still
+    search for literal fragments like "(kg)".
+    """
+    tokens = _tokenize_query(query)
+    haystack = f"{field_name} {path}".lower()
+    if not tokens:
+        return query.lower() in haystack
+    return all(t in haystack for t in tokens)
 
 from ems_mcp.api.client import EMSAPIError, EMSNotFoundError
 from ems_mcp.cache import database_cache, field_cache, make_cache_key
@@ -133,6 +171,61 @@ def _reset_result_store() -> None:
     global _next_ref  # noqa: PLW0603
     _result_store.clear()
     _next_ref = 0
+
+
+def _resolve_group_id_ref(group_ref: str | int | None) -> str | None:
+    """Resolve a numbered ``[N]`` reference to a stored field group ID.
+
+    Accepts:
+      - ``None`` -> return ``None`` (root-level browse)
+      - integer or pure-digit string ("5") -> result store lookup
+      - "[5]" (display form copied verbatim) -> normalised to "5"
+      - any other string -> pass through unchanged so raw bracket-encoded
+        group IDs continue to work
+
+    Raises:
+        ValueError: If the numeric reference is unknown or refers to a
+        non-group entry (e.g. an agent passes a field [N] in by mistake).
+    """
+    if group_ref is None:
+        return None
+
+    if isinstance(group_ref, str):
+        stripped = group_ref.strip()
+        # Accept the display form "[N]" (with surrounding brackets) the same
+        # way as a bare digit -- the formatter prints "[N]" so it's easy for
+        # an agent to copy that back verbatim.
+        if (
+            len(stripped) >= 3
+            and stripped.startswith("[")
+            and stripped.endswith("]")
+            and stripped[1:-1].isdigit()
+        ):
+            stripped = stripped[1:-1]
+        group_ref_norm: str | int = stripped
+    else:
+        group_ref_norm = group_ref
+
+    if isinstance(group_ref_norm, int) or (
+        isinstance(group_ref_norm, str) and group_ref_norm.isdigit()
+    ):
+        ref_num = int(group_ref_norm)
+        entry = _get_stored_result(ref_num)
+        if entry is None:
+            raise ValueError(
+                f"Reference [{ref_num}] not found in result store. "
+                "Re-run find_fields(mode='browse') to get fresh group references."
+            )
+        if entry.get("type") != "group":
+            raise ValueError(
+                f"Reference [{ref_num}] ('{entry.get('name')}') is a "
+                f"{entry.get('type')}, not a field group. "
+                "Pass a group reference from a browse-mode listing, or omit "
+                "group_id to browse from root."
+            )
+        return str(entry["id"])
+
+    return group_ref_norm if isinstance(group_ref_norm, str) else str(group_ref_norm)
 
 
 async def _resolve_field_id(
@@ -424,7 +517,12 @@ def _format_field_group(
     ems_system_id: int | None = None,
     database_id: str | None = None,
 ) -> str:
-    """Format field group response for display."""
+    """Format field group response for display.
+
+    Subgroups are assigned the same numbered ``[N]`` references as fields,
+    so the agent can drill down with ``find_fields(mode="browse",
+    group_id=N)`` instead of pasting bracket-encoded group IDs.
+    """
     lines = []
 
     group_name = group.get("name", "Root")
@@ -452,10 +550,20 @@ def _format_field_group(
         for g in groups:
             g_id = g.get("id", "?")
             g_name = g.get("name", "Unknown")
-            lines.append(f"  - {g_name} (ID: {g_id})")
+            ref = _store_result(
+                g_name, g_id, result_type="group",
+                ems_system_id=ems_system_id, database_id=database_id,
+            )
+            lines.append(f"  [{ref}] {g_name}")
 
     if not fields and not groups:
         lines.append("\n(Empty group)")
+
+    if groups:
+        lines.append(
+            "\nUse [N] reference numbers as group_id in find_fields("
+            "mode='browse', group_id=N) to drill down."
+        )
 
     return "\n".join(lines)
 
@@ -465,6 +573,7 @@ def _format_field_search_results(
     show_ids: bool = False,
     ems_system_id: int | None = None,
     database_id: str | None = None,
+    total_available: int | None = None,
 ) -> str:
     """Format field search results for display.
 
@@ -475,11 +584,23 @@ def _format_field_search_results(
         ems_system_id: EMS system the search ran against. Stored alongside
             each reference so subsequent name lookups stay DB-scoped.
         database_id: Database the search ran against.
+        total_available: Total matches the API returned before client-side
+            slicing. When greater than ``len(fields)``, the formatter notes
+            that results were truncated so the agent knows to raise
+            ``max_results`` rather than pivot to a different keyword.
     """
     if not fields:
         return "No fields found matching the search criteria."
 
-    lines = [f"Found {len(fields)} field(s):"]
+    if total_available is not None and total_available > len(fields):
+        header = (
+            f"Found {total_available} field(s) "
+            f"(showing first {len(fields)} -- pass max_results={total_available} "
+            "to see all):"
+        )
+    else:
+        header = f"Found {len(fields)} field(s):"
+    lines = [header]
     for f in fields:
         field_id = f.get("id", "?")
         field_name = f.get("name", "Unknown")
@@ -667,6 +788,7 @@ def _format_deep_search_results(
     show_ids: bool = False,
     ems_system_id: int | None = None,
     database_id: str | None = None,
+    result_cap_hit: bool = False,
 ) -> str:
     """Format recursive field search results for display.
 
@@ -679,6 +801,9 @@ def _format_deep_search_results(
             If False (default), assign numbered refs and hide IDs.
         ems_system_id: EMS system the search ran against.
         database_id: Database the search ran against.
+        result_cap_hit: True if BFS stopped because ``max_results`` was
+            reached (more matches may exist further in the tree). Triggers
+            an explicit "raise max_results to see more" hint.
 
     Returns:
         Formatted search results string.
@@ -691,7 +816,15 @@ def _format_deep_search_results(
                 msg += "\nBudget exhausted -- try increasing max_groups for a wider search."
         return msg
 
-    lines = [f"Found {len(results)} field(s) matching '{search_text}':"]
+    if result_cap_hit:
+        header = (
+            f"Found {len(results)} field(s) matching '{search_text}' "
+            "(result cap reached -- more matches may exist; "
+            "pass a higher max_results to see them):"
+        )
+    else:
+        header = f"Found {len(results)} field(s) matching '{search_text}':"
+    lines = [header]
 
     for f in results:
         field_name = f["name"]
@@ -792,8 +925,7 @@ async def _recursive_field_search(
     Returns:
         Tuple of (matching fields list, groups_visited count).
     """
-    search_lower = search_text.lower()
-    search_words = set(search_lower.split())
+    search_tokens = _tokenize_query(search_text)
     matches: list[dict[str, Any]] = []
     groups_visited = 0
 
@@ -819,30 +951,35 @@ async def _recursive_field_search(
 
         group_name = group.get("name", "")
         current_path = path_parts + [group_name] if group_name and depth > 0 else path_parts
+        path_str = " > ".join(current_path) if current_path else ""
 
-        # Check fields at this level
+        # Check fields at this level. Match query tokens across both the
+        # field name and its breadcrumb path so queries like "fuel landing"
+        # find "Best Touchdown (On) Fuel Quantity" under "...Landing >
+        # Reported > Metric" -- the disambiguating word lives in the path.
         for field in group.get("fields", []):
             if len(matches) >= max_results:
                 break
             field_name = field.get("name", "")
-            if search_lower in field_name.lower():
+            if _field_matches_query(field_name, path_str, search_text):
                 matches.append({
                     "name": field_name,
                     "id": field.get("id", ""),
                     "type": field.get("type", "unknown"),
                     "units": field.get("units"),
-                    "path": " > ".join(current_path) if current_path else "(root)",
+                    "path": path_str if path_str else "(root)",
                 })
 
-        # Enqueue subgroups with relevance prioritization
+        # Enqueue subgroups with relevance prioritization. A subgroup is
+        # "promising" if its name contains any query token as a substring;
+        # those go to the front so we explore the likely subtree first.
         if depth < max_depth:
             for sub in group.get("groups", []):
                 sub_id = sub.get("id")
                 if sub_id:
                     sub_name_lower = sub.get("name", "").lower()
                     entry = (sub_id, depth + 1, current_path)
-                    # Prioritize groups whose name contains a search word
-                    if search_words & set(sub_name_lower.split()):
+                    if search_tokens and any(t in sub_name_lower for t in search_tokens):
                         queue.appendleft(entry)
                     else:
                         queue.append(entry)
@@ -853,14 +990,15 @@ async def _recursive_field_search(
 async def _do_browse_fields(
     ems_system_id: int,
     database_id: str,
-    group_id: str | None,
+    group_id: str | int | None,
 ) -> str:
     """Browse mode: navigate field group hierarchy.
 
     Args:
         ems_system_id: The EMS system ID.
         database_id: Database ID.
-        group_id: Optional field group ID to navigate into.
+        group_id: Optional field group reference. May be an [N] number from
+            a prior browse listing or a raw bracket-encoded ID.
 
     Returns:
         Formatted field group listing.
@@ -871,6 +1009,13 @@ async def _do_browse_fields(
             "Use list_databases with this as group_id to navigate deeper and find "
             "actual database IDs."
         )
+
+    # Resolve numbered [N] subgroup refs from a prior browse listing back
+    # to their opaque group IDs before issuing the API call.
+    try:
+        group_id = _resolve_group_id_ref(group_id)
+    except ValueError as e:
+        return f"Error resolving group_id: {e}"
 
     client = get_client()
 
@@ -995,12 +1140,14 @@ async def _do_search_fields(
             )
         return f"Error searching fields: {e.message}"
 
+    total_available = len(fields)
     sliced = fields[:max_results]
     if include_field_info:
         sliced = await _enrich_with_field_info(client, ems_system_id, database_id, sliced)
     return _format_field_search_results(
         sliced, show_ids=show_ids,
         ems_system_id=ems_system_id, database_id=database_id,
+        total_available=total_available,
     )
 
 
@@ -1098,6 +1245,7 @@ async def _do_search_fields_multi(
             blocks.append("\n".join(block_lines))
             continue
 
+        total_available = len(outcome)
         sliced = outcome[:max_results]
         if include_field_info:
             sliced = await _enrich_with_field_info(
@@ -1107,6 +1255,7 @@ async def _do_search_fields_multi(
             _format_field_search_results(
                 sliced, show_ids=show_ids,
                 ems_system_id=ems_system_id, database_id=database_id,
+                total_available=total_available,
             )
         )
         blocks.append("\n".join(block_lines))
@@ -1218,10 +1367,14 @@ async def _do_deep_search_fields(
             client, ems_system_id, database_id, search_text.strip(),
             max_depth, max_results, max_groups,
         )
+        # BFS stops collecting once max_results is hit; signal that to
+        # the agent so it knows whether to raise the cap or pivot keywords.
+        result_cap_hit = len(results) >= max_results
         return _format_deep_search_results(
             results, search_text.strip(), groups_visited, max_groups,
             show_ids=show_ids,
             ems_system_id=ems_system_id, database_id=database_id,
+            result_cap_hit=result_cap_hit,
         )
     except EMSNotFoundError:
         return (
@@ -1297,7 +1450,7 @@ async def find_fields(
     database_id: str,
     mode: Literal["search", "browse", "deep"] = "search",
     search_text: str | list[str] | None = None,
-    group_id: str | None = None,
+    group_id: str | int | None = None,
     max_results: int = 50,
     max_depth: int = 5,
     max_groups: int = 50,
@@ -1326,7 +1479,9 @@ async def find_fields(
         search_text: Search keyword, or a list of keywords for parallel
             multi-term search. Required for search and deep modes.
             Multi-term lists are only supported in search mode.
-        group_id: Field group ID to navigate into (browse mode only).
+        group_id: Field group to navigate into (browse mode only). Accepts
+            an [N] reference number from a prior browse listing (e.g. 3 or
+            "[3]") or a raw bracket-encoded group ID. Omit for root.
         max_results: Maximum results per term (search/deep modes, default: 50).
         max_depth: Maximum traversal depth (deep mode, default: 5, max: 10).
         max_groups: Maximum API calls (deep mode, default: 50, max: 200).
