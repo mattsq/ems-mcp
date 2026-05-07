@@ -1,6 +1,6 @@
 # EMS API Summary
 
-Research notes on the EMS (Engine Monitoring System) API based on documentation and the Rems2 R package.
+Research notes on the EMS (Event Management System) API based on documentation and the Rems2 R package.
 
 ## Overview
 

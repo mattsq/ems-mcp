@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "ems-mcp"
 version = "0.1.0"
-description = "MCP server providing LLM access to the EMS (Engine Monitoring System) API for flight data analytics"
+description = "MCP server providing LLM access to the EMS (Event Management System) API for flight data analytics"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
