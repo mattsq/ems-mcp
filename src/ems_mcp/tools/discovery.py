@@ -279,11 +279,25 @@ async def _resolve_field_id(
         ref_num = int(field_ref) if isinstance(field_ref, str) else field_ref
         entry = _get_stored_result(ref_num)
         if entry is not None:
-            if entry.get("type") == "analytic":
+            entry_type = entry.get("type")
+            if entry_type == "analytic":
                 raise ValueError(
                     f"Reference [{ref_num}] ('{entry['name']}') is an analytic parameter, "
                     "not a database field. Use it with query_flight_analytics, "
                     "or use find_fields to find database field references."
+                )
+            if entry_type == "group":
+                raise ValueError(
+                    f"Reference [{ref_num}] ('{entry['name']}') is a field group, "
+                    "not a database field. Pass it as group_id to "
+                    "find_fields(mode='browse', group_id=N) to drill into it, "
+                    "or call find_fields with search_text to find a field [N]."
+                )
+            if entry_type is not None and entry_type != "field":
+                raise ValueError(
+                    f"Reference [{ref_num}] ('{entry.get('name')}') is a "
+                    f"{entry_type}, not a database field. Use find_fields "
+                    "to find a field reference."
                 )
             # Refuse to silently return a field ID stored against a different
             # database -- bracket-encoded IDs are not portable between

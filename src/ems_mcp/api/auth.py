@@ -169,8 +169,14 @@ class TokenManager:
         except httpx.RequestError as e:
             raise AuthenticationError(f"Network error during authentication: {e}") from e
 
-    def clear_token(self, expected_access_token: str | None = None) -> None:
+    async def clear_token(self, expected_access_token: str | None = None) -> None:
         """Clear the cached token, forcing re-authentication on next request.
+
+        Acquires ``self._token_lock`` so the compare-and-clear is atomic with
+        respect to a concurrent ``get_token`` refresh -- otherwise an
+        in-flight refresh could overwrite ``self._token`` after the
+        comparison succeeded but before the assignment, undoing a freshly
+        issued token.
 
         Args:
             expected_access_token: If provided, only clear when the cached
@@ -180,15 +186,16 @@ class TokenManager:
                 obtained -- avoiding a thundering-herd of re-authentications
                 when several in-flight requests share an expired token.
         """
-        if (
-            expected_access_token is not None
-            and self._token is not None
-            and self._token.access_token != expected_access_token
-        ):
-            logger.debug("Token already replaced; skipping clear")
-            return
-        self._token = None
-        logger.debug("Token cache cleared")
+        async with self._token_lock:
+            if (
+                expected_access_token is not None
+                and self._token is not None
+                and self._token.access_token != expected_access_token
+            ):
+                logger.debug("Token already replaced; skipping clear")
+                return
+            self._token = None
+            logger.debug("Token cache cleared")
 
     def get_auth_headers(self) -> dict[str, str]:
         """Get standard headers for authenticated API requests.

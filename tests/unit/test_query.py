@@ -2036,6 +2036,32 @@ class TestQueryDatabaseFieldResolution:
         assert "analytic parameter" in result
 
     @pytest.mark.asyncio
+    async def test_group_ref_rejected(self) -> None:
+        """A [N] ref pointing at a field group must not resolve as a field.
+
+        Group IDs are not valid field IDs; previously the resolver returned
+        the group ID unconditionally, letting query_database build an
+        invalid query body.
+        """
+        from ems_mcp.tools.discovery import _reset_result_store, _store_result
+        _reset_result_store()
+        _store_result(
+            "Operational",
+            "[group][operational]",
+            result_type="group",
+            ems_system_id=1,
+            database_id="[db]",
+        )
+
+        result = await _query_database(
+            ems_system_id=1,
+            database_id="[db]",
+            fields=[{"field_id": 0}],
+        )
+        assert "Error resolving field" in result
+        assert "field group" in result
+
+    @pytest.mark.asyncio
     async def test_cross_database_ref_rejected(self) -> None:
         """A [N] ref stored against DB-A must not silently resolve in DB-B.
 

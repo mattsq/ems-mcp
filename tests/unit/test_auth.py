@@ -1,5 +1,6 @@
 """Unit tests for authentication and token management."""
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
@@ -203,6 +204,49 @@ class TestTokenManager:
 
     @pytest.mark.asyncio
     @respx.mock
+    async def test_get_token_handles_401_with_oauth_body(
+        self, token_manager: TokenManager
+    ) -> None:
+        """A 401 from the token endpoint with an OAuth error body should
+        raise AuthenticationError carrying the parsed message and code,
+        not fall through to the generic "Unexpected response" path."""
+        respx.post("https://test-ems.example.com/api/token").mock(
+            return_value=httpx.Response(
+                401,
+                json={
+                    "error": "invalid_client",
+                    "error_description": "Client authentication failed.",
+                },
+            )
+        )
+
+        with pytest.raises(AuthenticationError) as exc_info:
+            await token_manager.get_token()
+
+        assert "client authentication failed" in str(exc_info.value).lower()
+        assert exc_info.value.error_code == "invalid_client"
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_get_token_handles_401_without_oauth_body(
+        self, token_manager: TokenManager
+    ) -> None:
+        """A 401 with a non-OAuth body still raises AuthenticationError and
+        includes the status code in the message so deployments returning
+        plain text get a useful error."""
+        respx.post("https://test-ems.example.com/api/token").mock(
+            return_value=httpx.Response(401, text="Unauthorized")
+        )
+
+        with pytest.raises(AuthenticationError) as exc_info:
+            await token_manager.get_token()
+
+        msg = str(exc_info.value)
+        assert "401" in msg
+        assert "Unauthorized" in msg
+
+    @pytest.mark.asyncio
+    @respx.mock
     async def test_get_token_handles_network_error(
         self, token_manager: TokenManager
     ) -> None:
@@ -216,7 +260,8 @@ class TestTokenManager:
 
         assert "network error" in str(exc_info.value).lower()
 
-    def test_clear_token(self, token_manager: TokenManager) -> None:
+    @pytest.mark.asyncio
+    async def test_clear_token(self, token_manager: TokenManager) -> None:
         """clear_token should remove cached token."""
         token_manager._token = CachedToken(
             access_token="test",
@@ -225,10 +270,11 @@ class TestTokenManager:
             base_url="https://test-ems.example.com",
         )
 
-        token_manager.clear_token()
+        await token_manager.clear_token()
         assert token_manager._token is None
 
-    def test_clear_token_skips_when_replaced(
+    @pytest.mark.asyncio
+    async def test_clear_token_skips_when_replaced(
         self, token_manager: TokenManager
     ) -> None:
         """clear_token(expected_access_token=...) is a no-op when the cached
@@ -245,12 +291,43 @@ class TestTokenManager:
             base_url="https://test-ems.example.com",
         )
 
-        token_manager.clear_token(expected_access_token="T1-stale")
+        await token_manager.clear_token(expected_access_token="T1-stale")
         assert token_manager._token is not None
         assert token_manager._token.access_token == "T2-fresh"
 
         # When the expected token matches the cached token, clear proceeds.
-        token_manager.clear_token(expected_access_token="T2-fresh")
+        await token_manager.clear_token(expected_access_token="T2-fresh")
+        assert token_manager._token is None
+
+    @pytest.mark.asyncio
+    async def test_clear_token_serialised_with_refresh(
+        self, token_manager: TokenManager
+    ) -> None:
+        """clear_token must take the same lock as get_token so an in-flight
+        refresh cannot overwrite the cache after the compare-and-clear's
+        equality check succeeds.
+        """
+        # Pre-load a stale token so clear_token would otherwise wipe it.
+        stale = CachedToken(
+            access_token="T1-stale",
+            token_type="bearer",
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            base_url="https://test-ems.example.com",
+        )
+        token_manager._token = stale
+
+        # Hold the token lock to simulate get_token() awaiting _request_token.
+        # clear_token must block on this lock instead of racing past it.
+        async with token_manager._token_lock:
+            cleared_task = asyncio.create_task(
+                token_manager.clear_token(expected_access_token="T1-stale")
+            )
+            # Give the task a chance to run; it must be parked on the lock.
+            await asyncio.sleep(0)
+            assert not cleared_task.done()
+            assert token_manager._token is stale
+        # Lock released -- clear can now proceed.
+        await cleared_task
         assert token_manager._token is None
 
     def test_get_auth_headers(self, token_manager: TokenManager) -> None:

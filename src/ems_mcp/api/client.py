@@ -289,7 +289,7 @@ class EMSClient:
             # the cache doesn't get its fresh token wiped here.
             if retry_count == 0 and self._token_manager:
                 logger.info("Got 401, clearing token and retrying")
-                self._token_manager.clear_token(expected_access_token=used_token)
+                await self._token_manager.clear_token(expected_access_token=used_token)
                 return await self._request(method, path, retry_count=1, **kwargs)
             raise AuthenticationError("Authentication failed after retry")
 

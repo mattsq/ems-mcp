@@ -82,7 +82,7 @@ class TestEMSClient:
                 "Accept": "application/json",
             }
         )
-        manager.clear_token = MagicMock()
+        manager.clear_token = AsyncMock()
         return manager
 
     @pytest.mark.asyncio
