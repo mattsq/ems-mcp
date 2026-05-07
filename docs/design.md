@@ -3,7 +3,7 @@
 ## Executive Summary
 
 ### Purpose
-This document describes the architecture and implementation plan for an MCP (Model Context Protocol) server that provides LLM access to the EMS (Engine Monitoring System) API. The server enables AI assistants like Claude to query flight data, discover analytics, and interact with EMS databases through natural language.
+This document describes the architecture and implementation plan for an MCP (Model Context Protocol) server that provides LLM access to the EMS (Event Management System) API. The server enables AI assistants like Claude to query flight data, discover analytics, and interact with EMS databases through natural language.
 
 ### Scope
 The MCP server will expose EMS API functionality as MCP tools, allowing LLMs to:
