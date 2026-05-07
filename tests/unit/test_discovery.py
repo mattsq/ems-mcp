@@ -1378,6 +1378,49 @@ class TestFormatDeepSearchResults:
         )
         assert "result cap reached" not in result
 
+    def test_clamp_disclosure_when_max_groups_clamped(self) -> None:
+        """When the agent passes a max_groups above the hard cap, the
+        request gets clamped silently inside the search; the formatter
+        should surface that so the agent knows raising the value further
+        won't help."""
+        _reset_result_store()
+        results = [
+            {"name": "Fuel A", "id": "f1", "type": "number",
+             "units": "kg", "path": "X"},
+        ]
+        result = _format_deep_search_results(
+            results, "fuel", groups_visited=500, max_groups=500,
+            max_groups_requested=2000,
+        )
+        assert "clamped" in result
+        assert "2000" in result
+        assert "500" in result
+
+    def test_clamp_disclosure_on_empty_results(self) -> None:
+        """The clamp note also fires when no results were found, so the
+        agent doesn't waste a follow-up call asking for a higher budget."""
+        result = _format_deep_search_results(
+            [], "fuel",
+            groups_visited=500, max_groups=500,
+            max_groups_requested=1000,
+        )
+        assert "No fields found" in result
+        assert "clamped" in result
+        assert "1000" in result
+
+    def test_no_clamp_disclosure_when_within_cap(self) -> None:
+        """Within the cap, no clamp note."""
+        _reset_result_store()
+        results = [
+            {"name": "Fuel A", "id": "f1", "type": "number",
+             "units": "kg", "path": "X"},
+        ]
+        result = _format_deep_search_results(
+            results, "fuel", groups_visited=200, max_groups=300,
+            max_groups_requested=300,
+        )
+        assert "clamped" not in result
+
 
 class TestRecursiveFieldSearch:
     """Tests for _recursive_field_search helper."""
@@ -1604,6 +1647,86 @@ class TestRecursiveFieldSearch:
         assert results[0]["name"] == "Flight Number"
         # "Flight Information" should have been visited before "Other Stuff"
         assert visit_order.index("flight") < visit_order.index("other")
+
+    @pytest.mark.asyncio
+    async def test_descendants_of_matching_ancestor_outrank_unrelated_branches(
+        self,
+    ) -> None:
+        """Once an ancestor's name covers a query token, all descendants of
+        that branch should out-rank descendants of branches whose ancestors
+        cover nothing -- even when the descendants' OWN names don't contain
+        any query token. This mirrors the production case where
+        "Best Touchdown Fuel Quantity" lives at depth 6 under
+        ".../Fuel/Descent and Landing/Landing/Reported/Metric": only "Fuel"
+        and "Landing" appear in the path; the field itself is reached via
+        intermediate groups whose names match nothing.
+        """
+        mock_client = MagicMock()
+        visit_order: list[str] = []
+
+        def mock_get(path: str, **kwargs: Any) -> Any:
+            if "groupId=" not in path:
+                return {
+                    "id": "[none]", "name": "Root",
+                    "fields": [],
+                    "groups": [
+                        # Listed first by the API. No query token in name.
+                        {"id": "unrelated", "name": "Aircraft Information"},
+                        # Listed second. Has "fuel" in name.
+                        {"id": "fuel", "name": "Fuel"},
+                    ],
+                }
+            visited_id = path.split("groupId=")[1]
+            visit_order.append(visited_id)
+            if visited_id == "fuel":
+                return {
+                    "id": "fuel", "name": "Fuel",
+                    "fields": [],
+                    # Intermediate group with no matching tokens.
+                    "groups": [{"id": "deep1", "name": "Phase 4"}],
+                }
+            if visited_id == "deep1":
+                return {
+                    "id": "deep1", "name": "Phase 4",
+                    "fields": [
+                        # Field name doesn't have "fuel"; only the ancestor path does.
+                        {"id": "f1", "name": "Best Touchdown Quantity (kg)", "type": "number"},
+                    ],
+                    "groups": [],
+                }
+            if visited_id == "unrelated":
+                # Lots of unrelated children that would burn budget if they
+                # were preferred over the matching subtree.
+                return {
+                    "id": "unrelated", "name": "Aircraft Information",
+                    "fields": [],
+                    "groups": [
+                        {"id": f"junk{i}", "name": f"Junk {i}"} for i in range(20)
+                    ],
+                }
+            # Junk groups: empty.
+            return {"id": visited_id, "name": "Junk", "fields": [], "groups": []}
+
+        mock_client.get = AsyncMock(side_effect=mock_get)
+
+        results, groups_visited = await _recursive_field_search(
+            mock_client, 1, "db", "fuel quantity",
+            max_depth=5, max_results=10, max_groups=50,
+        )
+
+        assert len(results) == 1
+        assert results[0]["name"] == "Best Touchdown Quantity (kg)"
+        # "Fuel" must have been popped before any of the unrelated junk children:
+        # the ancestor-token-coverage score should keep us on the right branch
+        # even though "Phase 4" itself contains none of the query tokens.
+        assert "fuel" in visit_order
+        assert "deep1" in visit_order
+        for j in range(20):
+            if f"junk{j}" in visit_order:
+                assert visit_order.index("deep1") < visit_order.index(f"junk{j}"), (
+                    f"deep1 should be visited before junk{j} -- "
+                    f"actual order: {visit_order}"
+                )
 
     @pytest.mark.asyncio
     async def test_path_token_disambiguates_field_name(self) -> None:
@@ -1932,6 +2055,28 @@ class TestFindFieldsDeep:
 
         assert "Found 1 field(s)" in result
         assert "Target" in result
+
+    @pytest.mark.asyncio
+    async def test_max_groups_clamp_disclosed_end_to_end(self) -> None:
+        """Passing max_groups above the hard cap should still run, but the
+        output should disclose the clamp -- previously the agent had no way
+        to tell its requested budget had been silently downgraded."""
+        from ems_mcp.tools.discovery import _MAX_GROUPS_HARD_CAP
+
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value={
+            "id": "[none]", "name": "Root", "fields": [], "groups": [],
+        })
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _find_fields(
+                ems_system_id=1, database_id="[db]",
+                mode="deep", search_text="anything",
+                max_groups=_MAX_GROUPS_HARD_CAP * 2,
+            )
+
+        assert "clamped" in result
+        assert str(_MAX_GROUPS_HARD_CAP * 2) in result
 
 
 class TestResultStore:

@@ -6,10 +6,10 @@ opaque strings that cannot be constructed manually.
 """
 
 import asyncio
+import heapq
 import logging
 import re
 import urllib.parse
-from collections import deque
 from typing import Any, Literal
 
 # Stop words skipped during tokenized matching. Kept small on purpose:
@@ -72,6 +72,13 @@ _STORE_MAX_SIZE: int = 500
 # search returns many fields to enrich. A small value (5) leaves headroom under
 # typical EMS rate limits while still preserving meaningful parallelism.
 _MAX_CONCURRENT_FIELD_REQUESTS: int = 5
+
+# Hard ceiling on max_groups for deep-mode BFS. Bigger budgets let the search
+# reach deeper subtrees (e.g. fields at depth 6+ with many sibling branches
+# competing for priority) without blowing past EMS rate limits. The previous
+# 200 cap was too tight for some real flight-data hierarchies; 500 leaves
+# meaningful headroom while still bounding worst-case latency.
+_MAX_GROUPS_HARD_CAP: int = 500
 
 
 def _store_result(
@@ -789,6 +796,7 @@ def _format_deep_search_results(
     ems_system_id: int | None = None,
     database_id: str | None = None,
     result_cap_hit: bool = False,
+    max_groups_requested: int | None = None,
 ) -> str:
     """Format recursive field search results for display.
 
@@ -796,7 +804,7 @@ def _format_deep_search_results(
         results: List of matching field dicts.
         search_text: The original search text (for display).
         groups_visited: Number of field-group API calls made.
-        max_groups: The max_groups budget that was configured.
+        max_groups: The max_groups budget that was configured (post-clamp).
         show_ids: If True, show full IDs inline (backward compat).
             If False (default), assign numbered refs and hide IDs.
         ems_system_id: EMS system the search ran against.
@@ -804,16 +812,35 @@ def _format_deep_search_results(
         result_cap_hit: True if BFS stopped because ``max_results`` was
             reached (more matches may exist further in the tree). Triggers
             an explicit "raise max_results to see more" hint.
+        max_groups_requested: The pre-clamp ``max_groups`` value the
+            caller passed in. When greater than ``max_groups``, the
+            formatter discloses that the request was clamped so the agent
+            knows it can't simply raise the value further.
 
     Returns:
         Formatted search results string.
     """
+    clamp_note = ""
+    if (
+        max_groups_requested is not None
+        and max_groups > 0
+        and max_groups_requested > max_groups
+    ):
+        clamp_note = (
+            f"\n(Note: requested max_groups={max_groups_requested} was clamped "
+            f"to the hard cap of {max_groups}. Narrow the search with mode='browse' "
+            "to drill into a specific subtree, or refine search_text with more "
+            "specific tokens.)"
+        )
+
     if not results:
         msg = f"No fields found matching '{search_text}' in deep search."
         if groups_visited > 0 and max_groups > 0:
             msg += f"\n(Searched {groups_visited} group(s), budget: {max_groups})"
             if groups_visited >= max_groups:
                 msg += "\nBudget exhausted -- try increasing max_groups for a wider search."
+        if clamp_note:
+            msg += clamp_note
         return msg
 
     if result_cap_hit:
@@ -859,6 +886,8 @@ def _format_deep_search_results(
         if groups_visited >= max_groups:
             stats += "\nBudget exhausted -- try increasing max_groups for a wider search."
         lines.append(stats)
+    if clamp_note:
+        lines.append(clamp_note)
 
     return "\n".join(lines)
 
@@ -929,15 +958,31 @@ async def _recursive_field_search(
     matches: list[dict[str, Any]] = []
     groups_visited = 0
 
-    # BFS queue entries: (group_id_or_None, depth, path_parts)
-    queue: deque[tuple[str | None, int, list[str]]] = deque()
-    queue.append((None, 0, []))
+    # Priority queue entries:
+    #   (missing_token_count, insertion_counter, group_id_or_None, depth, path_parts)
+    #
+    # Each candidate is scored by how many query tokens are NOT yet present
+    # in its cumulative breadcrumb path. Lower = more promising. Once we
+    # descend into a subtree whose ancestor matched a token (e.g. "Fuel"),
+    # all its descendants inherit that match -- so the heap keeps walking
+    # the right subtree even when individual subgroup names along the way
+    # contain none of the query tokens. Within a tier, ``insertion_counter``
+    # preserves FIFO order for stable, predictable behavior.
+    heap: list[tuple[int, int, str | None, int, list[str]]] = []
+    counter = 0
+    heapq.heappush(heap, (0, counter, None, 0, []))
+    counter += 1
 
-    while queue and len(matches) < max_results:
+    def _score(haystack: str) -> int:
+        if not search_tokens:
+            return 0
+        return sum(1 for t in search_tokens if t not in haystack)
+
+    while heap and len(matches) < max_results:
         if groups_visited >= max_groups:
             break
 
-        group_id, depth, path_parts = queue.popleft()
+        _, _, group_id, depth, path_parts = heapq.heappop(heap)
 
         if depth > max_depth:
             continue
@@ -970,19 +1015,25 @@ async def _recursive_field_search(
                     "path": path_str if path_str else "(root)",
                 })
 
-        # Enqueue subgroups with relevance prioritization. A subgroup is
-        # "promising" if its name contains any query token as a substring;
-        # those go to the front so we explore the likely subtree first.
+        # Enqueue subgroups, scored by how many query tokens their full
+        # cumulative path covers. A subgroup directly named after a token
+        # scores best, but a subgroup whose ancestor already covered a token
+        # (e.g. anything under "Fuel") still beats unrelated branches.
         if depth < max_depth:
+            parent_haystack_lower = path_str.lower()
             for sub in group.get("groups", []):
                 sub_id = sub.get("id")
                 if sub_id:
                     sub_name_lower = sub.get("name", "").lower()
-                    entry = (sub_id, depth + 1, current_path)
-                    if search_tokens and any(t in sub_name_lower for t in search_tokens):
-                        queue.appendleft(entry)
-                    else:
-                        queue.append(entry)
+                    child_haystack = (
+                        f"{parent_haystack_lower} {sub_name_lower}".strip()
+                    )
+                    score = _score(child_haystack)
+                    heapq.heappush(
+                        heap,
+                        (score, counter, sub_id, depth + 1, current_path),
+                    )
+                    counter += 1
 
     return matches, groups_visited
 
@@ -1351,7 +1402,8 @@ async def _do_deep_search_fields(
 
     max_depth = min(max(1, max_depth), 10)
     max_results = min(max(1, max_results), 50)
-    max_groups = min(max(1, max_groups), 200)
+    max_groups_requested = max_groups
+    max_groups = min(max(1, max_groups), _MAX_GROUPS_HARD_CAP)
 
     if "[entity-type-group]" in database_id:
         return (
@@ -1375,6 +1427,7 @@ async def _do_deep_search_fields(
             show_ids=show_ids,
             ems_system_id=ems_system_id, database_id=database_id,
             result_cap_hit=result_cap_hit,
+            max_groups_requested=max_groups_requested,
         )
     except EMSNotFoundError:
         return (
@@ -1484,7 +1537,9 @@ async def find_fields(
             "[3]") or a raw bracket-encoded group ID. Omit for root.
         max_results: Maximum results per term (search/deep modes, default: 50).
         max_depth: Maximum traversal depth (deep mode, default: 5, max: 10).
-        max_groups: Maximum API calls (deep mode, default: 50, max: 200).
+        max_groups: Maximum API calls (deep mode, default: 50, max: 500).
+            Values above the cap are clamped; the search output discloses
+            the clamp so the agent knows it was applied.
         show_ids: If True, show full IDs inline instead of numbered references.
         include_field_info: If True (search mode only), fetch full field
             metadata in parallel for every result so descriptions and
