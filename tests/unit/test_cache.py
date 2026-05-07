@@ -5,6 +5,7 @@ import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -235,6 +236,34 @@ class TestSQLiteCache:
         await cache.set("k", sample)
         result = await cache.get("k")
         assert result == sample
+
+    @pytest.mark.asyncio
+    async def test_set_drops_non_json_serialisable_value(
+        self, tmp_path: Path
+    ) -> None:
+        """A non-JSON-serialisable value (e.g. a set) must be dropped, not
+        propagate a TypeError out to the caller.
+
+        The cache is rebuildable and lives behind a tool call; aborting the
+        whole tool invocation because someone passed an unexpected type
+        would be worse than silently missing the cache.
+        """
+        cache: SQLiteCache[Any] = SQLiteCache(
+            db_path=tmp_path / "c.db", namespace="field",
+        )
+
+        # set() must not raise even for a value json.dumps can't handle.
+        await cache.set("set-key", {1, 2, 3})  # type: ignore[arg-type]
+        await cache.set("dt-key", datetime.now(timezone.utc))  # type: ignore[arg-type]
+
+        # The corresponding reads must miss (write was dropped).
+        assert await cache.get("set-key") is None
+        assert await cache.get("dt-key") is None
+
+        # And a subsequent valid write/read still works -- the cache is
+        # not poisoned by the failed write.
+        await cache.set("ok-key", {"id": "f1", "name": "Altitude"})
+        assert await cache.get("ok-key") == {"id": "f1", "name": "Altitude"}
 
     @pytest.mark.asyncio
     async def test_forged_pickle_blob_is_not_executed(self, tmp_path: Path) -> None:

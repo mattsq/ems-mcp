@@ -41,11 +41,11 @@ Follow these steps:
 2. Call list_databases to find the FDW Flights database
 3. Use find_fields to discover the field IDs for: Flight Record ID, \
 {'Tail Number, ' if tail_number else ''}{'Flight Date, ' if date_range else ''}and any other relevant fields
-4. Use get_result_id to get the full field IDs
-5. Query flight records with query_database using the discovered fields\
+4. Query flight records with query_database using the [N] references or \
+field names from step 3\
 {' and appropriate filters' if filter_instructions else ''}
-6. Use query_flight_analytics with the flight IDs and analytics: {parameters}
-7. Summarize the results
+5. Use query_flight_analytics with the flight IDs and analytics: {parameters}
+6. Summarize the results
 """,
     )]
 

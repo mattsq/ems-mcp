@@ -357,7 +357,11 @@ class SQLiteCache(Generic[T]):
             await asyncio.to_thread(
                 self._set_sync, key, value, ttl if ttl is not None else self._default_ttl,
             )
-        except (sqlite3.Error, OSError) as e:
+        except (sqlite3.Error, OSError, TypeError, ValueError) as e:
+            # TypeError/ValueError cover ``json.dumps`` failing on a value
+            # that is not JSON-serialisable (e.g. a Pydantic model, set,
+            # datetime). The cache is rebuildable, so we degrade to "write
+            # dropped" rather than aborting the caller's tool invocation.
             logger.warning("SQLiteCache.set failed (%s); write dropped", e)
             return
         logger.debug(
