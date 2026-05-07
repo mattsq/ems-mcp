@@ -80,6 +80,20 @@ _MAX_CONCURRENT_FIELD_REQUESTS: int = 5
 # meaningful headroom while still bounding worst-case latency.
 _MAX_GROUPS_HARD_CAP: int = 500
 
+# Documented default budget for unscoped deep search. Tight on purpose --
+# walking a full database from the root with this is fine for shallow leaves
+# and converges fast when the path-aware prioritization can lean on a
+# discriminating root subgroup name.
+_DEFAULT_MAX_GROUPS: int = 50
+
+# Default budget when the caller has scoped deep search to a subtree via
+# group_id. A narrowed subtree typically still has several layers of
+# children (e.g. "Fuel" has ~7 children with many grandchildren each), so
+# 50 runs out before reaching depth-3-relative leaves. The bump kicks in
+# only when the caller leaves max_groups at _DEFAULT_MAX_GROUPS -- explicit
+# overrides are always honored.
+_SCOPED_DEFAULT_MAX_GROUPS: int = 200
+
 
 def _store_result(
     name: str,
@@ -1607,6 +1621,10 @@ async def find_fields(
         max_results: Maximum results per term (search/deep modes, default: 50).
         max_depth: Maximum traversal depth (deep mode, default: 5, max: 10).
         max_groups: Maximum API calls (deep mode, default: 50, max: 500).
+            When ``mode='deep'`` is combined with ``group_id`` and this
+            argument is left at the default, the budget is auto-raised to
+            200 because narrowed subtrees still tend to be several layers
+            deep. Explicit values are honored unchanged.
             Values above the cap are clamped; the search output discloses
             the clamp so the agent knows it was applied.
         show_ids: If True, show full IDs inline instead of numbered references.
@@ -1644,9 +1662,18 @@ async def find_fields(
                 "Error: deep mode does not support multi-term search. "
                 "Pass a single string to search_text, or call again per term."
             )
+        # When the agent has scoped deep search to a subtree via group_id
+        # but left max_groups at the documented default, raise the budget.
+        # A narrowed subtree typically still has several deep layers and
+        # the unscoped default of 50 runs out before reaching them. An
+        # explicit max_groups value (anything other than the default) is
+        # honored unchanged.
+        effective_max_groups = max_groups
+        if group_id is not None and max_groups == _DEFAULT_MAX_GROUPS:
+            effective_max_groups = _SCOPED_DEFAULT_MAX_GROUPS
         return await _do_deep_search_fields(
             ems_system_id, database_id, search_text,
-            max_results, max_depth, max_groups, show_ids,
+            max_results, max_depth, effective_max_groups, show_ids,
             root_group_id=group_id,
         )
     else:  # mode == "search" (default)

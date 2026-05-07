@@ -2171,6 +2171,90 @@ class TestFindFieldsDeep:
         assert "Error" in result
         assert "not a field group" in result
 
+    @pytest.mark.asyncio
+    async def test_scoped_deep_search_auto_bumps_default_budget(self) -> None:
+        """When the agent passes group_id but leaves max_groups at the
+        documented default (50), the effective budget should auto-raise
+        to 200 because narrowed subtrees still tend to be several layers
+        deep. Verified via the disclosed budget in the formatted output.
+        """
+        _reset_result_store()
+        from ems_mcp.tools.discovery import _store_result, _SCOPED_DEFAULT_MAX_GROUPS
+
+        # Stand up a deep mock subtree so BFS can run for several hops.
+        def mock_get(path: str, **kwargs: Any) -> Any:
+            if "groupId=root" in path:
+                return {
+                    "id": "root", "name": "Fuel",
+                    "fields": [],
+                    "groups": [{"id": f"c{i}", "name": f"Child {i}"} for i in range(5)],
+                }
+            return {"id": "leaf", "name": "Leaf",
+                    "fields": [], "groups": []}
+
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(side_effect=mock_get)
+        ref = _store_result(
+            "Fuel", "root", result_type="group",
+            ems_system_id=1, database_id="[db]",
+        )
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _find_fields(
+                ems_system_id=1, database_id="[db]",
+                mode="deep", search_text="nothing-matches",
+                group_id=ref,
+                # max_groups left at default
+            )
+
+        # Effective budget should be the scoped default, not 50.
+        assert f"budget: {_SCOPED_DEFAULT_MAX_GROUPS}" in result
+
+    @pytest.mark.asyncio
+    async def test_scoped_deep_search_honors_explicit_max_groups(self) -> None:
+        """An explicit max_groups -- even one that equals the auto-bump
+        target -- should be honored as-is; the auto-bump only fires when
+        the caller leaves the default in place."""
+        _reset_result_store()
+        from ems_mcp.tools.discovery import _store_result
+
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value={
+            "id": "root", "name": "Fuel", "fields": [], "groups": [],
+        })
+        ref = _store_result(
+            "Fuel", "root", result_type="group",
+            ems_system_id=1, database_id="[db]",
+        )
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _find_fields(
+                ems_system_id=1, database_id="[db]",
+                mode="deep", search_text="anything",
+                group_id=ref,
+                max_groups=75,  # explicit, neither default nor scoped-default
+            )
+        assert "budget: 75" in result
+
+    @pytest.mark.asyncio
+    async def test_unscoped_deep_search_uses_unscoped_default(self) -> None:
+        """Without group_id, the budget stays at the unscoped default of 50."""
+        _reset_result_store()
+        from ems_mcp.tools.discovery import _DEFAULT_MAX_GROUPS
+
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value={
+            "id": "[none]", "name": "Root", "fields": [], "groups": [],
+        })
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _find_fields(
+                ems_system_id=1, database_id="[db]",
+                mode="deep", search_text="anything",
+                # group_id omitted, max_groups omitted
+            )
+        assert f"budget: {_DEFAULT_MAX_GROUPS}" in result
+
 
 class TestResultStore:
     """Tests for the result reference store."""
