@@ -2078,6 +2078,99 @@ class TestFindFieldsDeep:
         assert "clamped" in result
         assert str(_MAX_GROUPS_HARD_CAP * 2) in result
 
+    @pytest.mark.asyncio
+    async def test_deep_search_with_root_group_id_scopes_to_subtree(self) -> None:
+        """Passing group_id in deep mode should start BFS from that subtree
+        and skip the rest of the database. Result paths should include the
+        root group's name so the agent can place the result.
+        """
+        _reset_result_store()
+        long_root_id = (
+            "[-hub-][field-group][[[ems-core][entity-type][foqa-flights]]"
+            "[[some-internal-id][internal-field-group][fuel-group]]]"
+        )
+
+        captured: list[str] = []
+
+        def mock_get(path: str, **kwargs: Any) -> Any:
+            captured.append(path)
+            if "groupId=" not in path:
+                # Should NOT be hit -- BFS should start from the rooted group.
+                pytest.fail(
+                    "Deep search with root_group_id should not fetch the "
+                    f"database root. Got path: {path}"
+                )
+            visited = path.split("groupId=")[1]
+            if visited == long_root_id:
+                return {
+                    "id": long_root_id, "name": "Fuel",
+                    "fields": [],
+                    "groups": [{"id": "deep1", "name": "4) Descent and Landing"}],
+                }
+            if visited == "deep1":
+                return {
+                    "id": "deep1", "name": "4) Descent and Landing",
+                    "fields": [
+                        {"id": "f-best", "name": "Best Touchdown Fuel Quantity (kg)", "type": "number"},
+                    ],
+                    "groups": [],
+                }
+            return {"id": visited, "name": "X", "fields": [], "groups": []}
+
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(side_effect=mock_get)
+
+        # First, browse so the [N] ref maps to long_root_id.
+        # We mock that by storing the result directly.
+        from ems_mcp.tools.discovery import _store_result
+        ref = _store_result(
+            "Fuel", long_root_id, result_type="group",
+            ems_system_id=1, database_id="[db]",
+        )
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _find_fields(
+                ems_system_id=1, database_id="[db]",
+                mode="deep", search_text="touchdown fuel",
+                group_id=ref,
+            )
+
+        assert "Best Touchdown Fuel Quantity (kg)" in result
+        # Path should start at "Fuel" (the rooted ancestor) so the agent
+        # knows where the result lives within the broader tree.
+        assert "Fuel > 4) Descent and Landing" in result
+        # First API call should target the rooted group, not the DB root.
+        assert long_root_id in captured[0]
+
+    @pytest.mark.asyncio
+    async def test_deep_search_unknown_root_group_ref_errors(self) -> None:
+        """An unknown [N] ref passed as group_id in deep mode should
+        surface a clear error rather than silently searching the whole
+        database."""
+        _reset_result_store()
+        result = await _find_fields(
+            ems_system_id=1, database_id="[db]",
+            mode="deep", search_text="anything",
+            group_id=999,
+        )
+        assert "Error" in result
+        assert "999" in result
+
+    @pytest.mark.asyncio
+    async def test_deep_search_field_ref_as_root_group_errors(self) -> None:
+        """Passing a field [N] (not a group) as the deep-search root
+        should fail loudly."""
+        _reset_result_store()
+        from ems_mcp.tools.discovery import _store_result
+        ref = _store_result("Altitude", "[fld][alt]", result_type="field")
+        result = await _find_fields(
+            ems_system_id=1, database_id="[db]",
+            mode="deep", search_text="anything",
+            group_id=ref,
+        )
+        assert "Error" in result
+        assert "not a field group" in result
+
 
 class TestResultStore:
     """Tests for the result reference store."""
@@ -2472,6 +2565,79 @@ class TestResolveFieldId:
             await _resolve_field_id("Flight Date", ems_system_id=1, database_id="[db]")
             await _resolve_field_id("Flight Date", ems_system_id=1, database_id="[db]")
         assert mock_client.get.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_entity_type_resolver_short_circuits_on_exact_name(self) -> None:
+        """In an entity-type DB, the BFS resolver should return the literal
+        named field even when path-aware partial matches would otherwise
+        fill its result slate first.
+
+        Mirrors the production case: the user passes "Flight Date" but the
+        BFS encounters lots of "Date-Time at X" fields whose path covers
+        "flight" and whose name covers "date" -- under path-aware-only
+        matching they'd out-fill the buffer before the literal "Flight Date"
+        field at depth 4 was even visited.
+        """
+        mock_client = MagicMock()
+        call_log: list[str] = []
+
+        def mock_get(path: str, **kwargs: Any) -> Any:
+            call_log.append(path)
+            if "groupId=" not in path:
+                return {
+                    "id": "[none]", "name": "Root",
+                    "fields": [],
+                    "groups": [
+                        {"id": "flight_info", "name": "Flight Information"},
+                        {"id": "operational", "name": "Operational Information"},
+                    ],
+                }
+            if "groupId=flight_info" in path:
+                return {
+                    "id": "flight_info", "name": "Flight Information",
+                    "fields": [],
+                    "groups": [{"id": "date_times", "name": "Date Times"}],
+                }
+            if "groupId=date_times" in path:
+                # These would be partial path-aware matches for "Flight Date"
+                # (path covers "flight", name covers "date") -- filling the
+                # slate before the literal field was visited.
+                return {
+                    "id": "date_times", "name": "Date Times",
+                    "fields": [
+                        {"id": "f-takeoff", "name": "Date-Time at Takeoff", "type": "dateTime"},
+                        {"id": "f-touchdown", "name": "Date-Time at Touchdown", "type": "dateTime"},
+                    ],
+                    "groups": [],
+                }
+            if "groupId=operational" in path:
+                return {
+                    "id": "operational", "name": "Operational Information",
+                    "fields": [],
+                    "groups": [{"id": "general", "name": "General Flight Information"}],
+                }
+            if "groupId=general" in path:
+                return {
+                    "id": "general", "name": "General Flight Information",
+                    "fields": [
+                        {"id": "f-flight-date", "name": "Flight Date", "type": "dateTime"},
+                    ],
+                    "groups": [],
+                }
+            return {"id": "x", "name": "X", "fields": [], "groups": []}
+
+        mock_client.get = AsyncMock(side_effect=mock_get)
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _resolve_field_id(
+                "Flight Date",
+                ems_system_id=1,
+                database_id="[ems-core][entity-type][foqa-flights]",
+            )
+
+        # Must resolve to the literal "Flight Date" field, not one of the
+        # "Date-Time at ..." partial-match fields.
+        assert result == "f-flight-date"
 
     @pytest.mark.asyncio
     async def test_analytic_ref_rejected(self) -> None:

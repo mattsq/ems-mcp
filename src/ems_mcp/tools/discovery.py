@@ -301,12 +301,17 @@ async def _resolve_field_id(
     client = get_client()
 
     # Entity-type databases don't support the field search endpoint (405);
-    # fall back to BFS traversal of field groups.
+    # fall back to BFS traversal of field groups. Use the exact-name
+    # short-circuit so the BFS returns the literal "Flight Date" field
+    # (depth 4) rather than filling its result slate with path-aware
+    # partial matches like "Date-Time at Liftoff" before the literal
+    # field is even considered.
     if _is_entity_type_database(database_id):
         matches, _ = await _recursive_field_search(
             client, ems_system_id, database_id,
             search_text=field_ref,
-            max_depth=10, max_results=50, max_groups=50,
+            max_depth=10, max_results=50, max_groups=_MAX_GROUPS_HARD_CAP,
+            exact_name_short_circuit=field_ref,
         )
         search_results = matches
     else:
@@ -939,6 +944,9 @@ async def _recursive_field_search(
     max_depth: int,
     max_results: int,
     max_groups: int,
+    *,
+    root_group_id: str | None = None,
+    exact_name_short_circuit: str | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """BFS traversal of field groups to find fields matching search text.
 
@@ -950,6 +958,17 @@ async def _recursive_field_search(
         max_depth: Maximum depth to traverse.
         max_results: Maximum number of matching fields to return.
         max_groups: Hard cap on total field-group API calls to prevent timeouts.
+        root_group_id: When set, BFS starts from this group instead of the
+            database root. Useful for scoping a deep search to a known
+            subtree (e.g. after browsing to "Operational > Fuel").
+            Result paths display relative to this root and include the
+            root group's name at the front.
+        exact_name_short_circuit: When set, BFS stops and returns
+            immediately upon encountering a field whose name (case-
+            insensitive) equals this string. Used by the field resolver
+            so that asking for "Flight Date" returns the literal
+            ``Flight Date`` field instead of being out-prioritized by
+            path-aware partial matches like ``Date-Time at Liftoff``.
 
     Returns:
         Tuple of (matching fields list, groups_visited count).
@@ -957,6 +976,12 @@ async def _recursive_field_search(
     search_tokens = _tokenize_query(search_text)
     matches: list[dict[str, Any]] = []
     groups_visited = 0
+    started_at_subtree = root_group_id is not None
+    exact_lower = (
+        exact_name_short_circuit.lower()
+        if exact_name_short_circuit
+        else None
+    )
 
     # Priority queue entries:
     #   (missing_token_count, insertion_counter, group_id_or_None, depth, path_parts)
@@ -970,7 +995,7 @@ async def _recursive_field_search(
     # preserves FIFO order for stable, predictable behavior.
     heap: list[tuple[int, int, str | None, int, list[str]]] = []
     counter = 0
-    heapq.heappush(heap, (0, counter, None, 0, []))
+    heapq.heappush(heap, (0, counter, root_group_id, 0, []))
     counter += 1
 
     def _score(haystack: str) -> int:
@@ -978,7 +1003,17 @@ async def _recursive_field_search(
             return 0
         return sum(1 for t in search_tokens if t not in haystack)
 
-    while heap and len(matches) < max_results:
+    # When ``exact_name_short_circuit`` is in effect we keep popping past
+    # ``max_results`` so that the exact match gets a chance to surface
+    # even after the result list is full.
+    def _should_continue() -> bool:
+        if not heap:
+            return False
+        if exact_lower is not None:
+            return True
+        return len(matches) < max_results
+
+    while _should_continue():
         if groups_visited >= max_groups:
             break
 
@@ -995,7 +1030,12 @@ async def _recursive_field_search(
             continue
 
         group_name = group.get("name", "")
-        current_path = path_parts + [group_name] if group_name and depth > 0 else path_parts
+        # Include the root group's own name in the path when the caller
+        # rooted the search at a specific subtree -- otherwise descendants
+        # would render with a confusing "...subgroup > leaf" prefix that
+        # silently elides the rooted ancestor.
+        include_name = bool(group_name) and (depth > 0 or started_at_subtree)
+        current_path = path_parts + [group_name] if include_name else path_parts
         path_str = " > ".join(current_path) if current_path else ""
 
         # Check fields at this level. Match query tokens across both the
@@ -1003,9 +1043,21 @@ async def _recursive_field_search(
         # find "Best Touchdown (On) Fuel Quantity" under "...Landing >
         # Reported > Metric" -- the disambiguating word lives in the path.
         for field in group.get("fields", []):
-            if len(matches) >= max_results:
-                break
             field_name = field.get("name", "")
+            if exact_lower is not None and field_name.lower() == exact_lower:
+                # Exact name match wins outright -- discard everything else.
+                return (
+                    [{
+                        "name": field_name,
+                        "id": field.get("id", ""),
+                        "type": field.get("type", "unknown"),
+                        "units": field.get("units"),
+                        "path": path_str if path_str else "(root)",
+                    }],
+                    groups_visited,
+                )
+            if len(matches) >= max_results:
+                continue
             if _field_matches_query(field_name, path_str, search_text):
                 matches.append({
                     "name": field_name,
@@ -1382,6 +1434,7 @@ async def _do_deep_search_fields(
     max_depth: int,
     max_groups: int,
     show_ids: bool,
+    root_group_id: str | int | None = None,
 ) -> str:
     """Deep mode: BFS traversal of field group hierarchy.
 
@@ -1393,6 +1446,9 @@ async def _do_deep_search_fields(
         max_depth: Maximum traversal depth.
         max_groups: Maximum API calls.
         show_ids: Show full IDs inline.
+        root_group_id: Optional [N] reference or opaque group ID to scope
+            BFS to a specific subtree. When set, the search starts from
+            that group instead of the database root.
 
     Returns:
         Formatted deep search results.
@@ -1412,12 +1468,19 @@ async def _do_deep_search_fields(
             "actual database IDs."
         )
 
+    # Resolve a numbered [N] subtree reference (or pass through a raw ID).
+    try:
+        resolved_root = _resolve_group_id_ref(root_group_id)
+    except ValueError as e:
+        return f"Error resolving root_group_id: {e}"
+
     client = get_client()
 
     try:
         results, groups_visited = await _recursive_field_search(
             client, ems_system_id, database_id, search_text.strip(),
             max_depth, max_results, max_groups,
+            root_group_id=resolved_root,
         )
         # BFS stops collecting once max_results is hit; signal that to
         # the agent so it knows whether to raise the cap or pivot keywords.
@@ -1517,6 +1580,9 @@ async def find_fields(
     - browse: Navigate field group hierarchy. Use group_id to drill down.
     - deep: BFS traversal across all field groups. Requires search_text.
       Works on ALL databases including entity-type. Slower (multiple API calls).
+      Pass group_id to scope BFS to a specific subtree -- much faster
+      than searching from the database root when the relevant area is
+      already known (e.g. after a browse).
 
     Results show numbered references [N] that can be used directly in
     query_database, get_field_info, etc. Field names also work.
@@ -1532,9 +1598,12 @@ async def find_fields(
         search_text: Search keyword, or a list of keywords for parallel
             multi-term search. Required for search and deep modes.
             Multi-term lists are only supported in search mode.
-        group_id: Field group to navigate into (browse mode only). Accepts
-            an [N] reference number from a prior browse listing (e.g. 3 or
-            "[3]") or a raw bracket-encoded group ID. Omit for root.
+        group_id: Field group context. In browse mode, navigates into
+            that group. In deep mode, scopes BFS to that subtree
+            (skipping the rest of the database). Accepts an [N] reference
+            number from a prior browse listing (e.g. 3 or "[3]") or a raw
+            bracket-encoded group ID. Ignored in search mode. Omit to
+            start from the database root.
         max_results: Maximum results per term (search/deep modes, default: 50).
         max_depth: Maximum traversal depth (deep mode, default: 5, max: 10).
         max_groups: Maximum API calls (deep mode, default: 50, max: 500).
@@ -1578,6 +1647,7 @@ async def find_fields(
         return await _do_deep_search_fields(
             ems_system_id, database_id, search_text,
             max_results, max_depth, max_groups, show_ids,
+            root_group_id=group_id,
         )
     else:  # mode == "search" (default)
         if not search_text:
