@@ -1,6 +1,6 @@
 # EMS MCP Server
 
-An MCP (Model Context Protocol) server that provides LLM access to the EMS (Event Monitoring System) API for flight data analytics.
+An MCP (Model Context Protocol) server that provides LLM access to the EMS (Engine Monitoring System) API for flight data analytics.
 
 ## Prerequisites
 
@@ -115,23 +115,39 @@ Create `.gemini/settings.json` in the project directory:
 ## Available Tools
 
 ### Discovery
-- `list_ems_systems` -- List available EMS systems
-- `list_databases` -- Navigate database hierarchy
-- `list_fields` -- Navigate field hierarchy
-- `search_fields` -- Search for field IDs by name
-- `get_field_info` -- Get detailed field metadata and discrete value mappings
-- `search_analytics` -- Search for time-series analytic IDs
+- `list_ems_systems` -- List available EMS systems (start here)
+- `list_databases` -- Navigate the database hierarchy
+- `find_fields` -- Find fields by keyword (`mode="search"`), browse the field group tree (`mode="browse"`), or BFS-traverse entity-type databases (`mode="deep"`); returns numbered `[N]` references usable directly in other tools
+- `get_field_info` -- Get field metadata and discrete value mappings
+- `search_analytics` -- Search for time-series analytics by name (altitude, airspeed, etc.)
+- `get_result_id` -- (Deprecated) Resolve `[N]` references to full opaque IDs; no longer needed in the standard workflow
 
 ### Querying
-- `query_database` -- Query flight records with filters and sorting
+- `query_database` -- Query flight records with filters, sorting, and aggregation
 - `query_flight_analytics` -- Get time-series data for specific flights
 
 ### Assets
-- `list_fleets` -- List aircraft fleets
-- `list_aircraft` -- List aircraft (tail numbers)
-- `list_airports` -- List airports with codes and locations
-- `list_flight_phases` -- List flight phase definitions
-- `ping_system` -- Check system health and server time
+- `get_assets` -- Get reference data: `asset_type` of `fleets`, `aircraft` (optionally filtered by `fleet_id`), `airports`, or `flight_phases`
+- `ping_system` -- Check whether an EMS system is online
+
+## Resources
+
+The server also exposes MCP resources for stable reference data:
+
+- `ems://workflow-guide` -- Discovery-to-query workflow guide
+- `ems://systems` -- List of available EMS systems (cached)
+- `ems://systems/{system_id}/fleets` -- Fleet catalog for a system (cached)
+- `ems://systems/{system_id}/airports` -- Airport reference data (cached)
+- `ems://databases/common-fields` -- Index of databases with curated field vocabularies
+- `ems://databases/{database_name}/common-fields` -- Curated common fields for a named database (e.g. `FDW Flights`)
+
+## Prompts
+
+Reusable templates that pre-encode multi-step EMS workflows:
+
+- `analyze_flights` -- Discovery -> query -> analytics for a tail number / date range
+- `compare_flights` -- Side-by-side time-series comparison between two flight IDs
+- `search_flight_parameters` -- Discover available fields by keyword, with entity-database support
 
 ## Development
 
