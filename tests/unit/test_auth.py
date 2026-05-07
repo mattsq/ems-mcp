@@ -228,6 +228,31 @@ class TestTokenManager:
         token_manager.clear_token()
         assert token_manager._token is None
 
+    def test_clear_token_skips_when_replaced(
+        self, token_manager: TokenManager
+    ) -> None:
+        """clear_token(expected_access_token=...) is a no-op when the cached
+        token was already replaced.
+
+        Prevents the race where a concurrent request 401s on stale token T1
+        while another request has already refreshed the cache to T2 -- we
+        must not wipe T2 just because T1 expired.
+        """
+        token_manager._token = CachedToken(
+            access_token="T2-fresh",
+            token_type="bearer",
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            base_url="https://test-ems.example.com",
+        )
+
+        token_manager.clear_token(expected_access_token="T1-stale")
+        assert token_manager._token is not None
+        assert token_manager._token.access_token == "T2-fresh"
+
+        # When the expected token matches the cached token, clear proceeds.
+        token_manager.clear_token(expected_access_token="T2-fresh")
+        assert token_manager._token is None
+
     def test_get_auth_headers(self, token_manager: TokenManager) -> None:
         """get_auth_headers should return standard headers."""
         headers = token_manager.get_auth_headers()

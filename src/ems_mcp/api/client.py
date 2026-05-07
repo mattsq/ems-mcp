@@ -226,15 +226,23 @@ class EMSClient:
         headers = self._token_manager.get_auth_headers()
         headers["Authorization"] = f"Bearer {token}"
 
-        # Merge with any provided headers
-        if "headers" in kwargs:
-            headers.update(kwargs.pop("headers"))
+        # Build request kwargs without mutating the caller's dict. Popping
+        # "headers" from kwargs would lose user-provided headers on the
+        # 401/retry recursive call, since that path re-uses the same kwargs.
+        request_kwargs = dict(kwargs)
+        extra_headers = request_kwargs.pop("headers", None)
+        if extra_headers:
+            headers.update(extra_headers)
 
         logger.debug("%s %s (attempt %d)", method, path, retry_count + 1)
 
         try:
-            response = await self._http_client.request(method, url, headers=headers, **kwargs)
-            return await self._handle_response(response, method, path, retry_count, kwargs)
+            response = await self._http_client.request(
+                method, url, headers=headers, **request_kwargs
+            )
+            return await self._handle_response(
+                response, method, path, retry_count, kwargs, used_token=token
+            )
 
         except httpx.TimeoutException as e:
             logger.warning("Request timeout for %s %s: %s", method, path, e)
@@ -263,6 +271,7 @@ class EMSClient:
         path: str,
         retry_count: int,
         kwargs: dict[str, Any],
+        used_token: str | None = None,
     ) -> Any:
         """Handle HTTP response, including error cases and retries."""
         status = response.status_code
@@ -275,10 +284,12 @@ class EMSClient:
 
         # Handle specific error codes
         if status == 401:
-            # Token expired or invalid - clear and retry once
+            # Token expired or invalid - clear and retry once. Pass the token
+            # we actually used so a concurrent request that already replaced
+            # the cache doesn't get its fresh token wiped here.
             if retry_count == 0 and self._token_manager:
                 logger.info("Got 401, clearing token and retrying")
-                self._token_manager.clear_token()
+                self._token_manager.clear_token(expected_access_token=used_token)
                 return await self._request(method, path, retry_count=1, **kwargs)
             raise AuthenticationError("Authentication failed after retry")
 

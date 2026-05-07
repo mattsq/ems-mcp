@@ -132,11 +132,12 @@ def _store_result(
         "database_id": database_id,
     }
 
-    # Evict oldest entries when over capacity
-    if len(_result_store) > _STORE_MAX_SIZE:
-        oldest_keys = sorted(_result_store.keys())[: len(_result_store) - _STORE_MAX_SIZE]
-        for k in oldest_keys:
-            del _result_store[k]
+    # Evict oldest entries when over capacity. dict preserves insertion
+    # order, so the iteration head is the oldest entry -- this is robust
+    # even if ``_next_ref`` is reset (e.g. by the test helper) and reused.
+    while len(_result_store) > _STORE_MAX_SIZE:
+        oldest_key = next(iter(_result_store))
+        del _result_store[oldest_key]
 
     return ref
 
@@ -283,6 +284,20 @@ async def _resolve_field_id(
                     f"Reference [{ref_num}] ('{entry['name']}') is an analytic parameter, "
                     "not a database field. Use it with query_flight_analytics, "
                     "or use find_fields to find database field references."
+                )
+            # Refuse to silently return a field ID stored against a different
+            # database -- bracket-encoded IDs are not portable between
+            # databases, so reusing [N] across DBs would corrupt the query.
+            entry_ems = entry.get("ems_system_id")
+            entry_db = entry.get("database_id")
+            if entry_ems is not None and entry_db is not None and (
+                entry_ems != ems_system_id or entry_db != database_id
+            ):
+                raise ValueError(
+                    f"Reference [{ref_num}] ('{entry.get('name')}') was stored against a "
+                    f"different database (ems_system_id={entry_ems}, database_id={entry_db}). "
+                    "Re-run find_fields against the current database to get a fresh "
+                    "reference, or pass the field name directly."
                 )
             return entry["id"]
         raise ValueError(

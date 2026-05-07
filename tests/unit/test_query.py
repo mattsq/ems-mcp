@@ -2036,6 +2036,33 @@ class TestQueryDatabaseFieldResolution:
         assert "analytic parameter" in result
 
     @pytest.mark.asyncio
+    async def test_cross_database_ref_rejected(self) -> None:
+        """A [N] ref stored against DB-A must not silently resolve in DB-B.
+
+        Bracket-encoded field IDs are not portable across databases. The
+        resolver used to return the stored ID unconditionally, which would
+        have produced a query against DB-B with DB-A's field ID.
+        """
+        from ems_mcp.tools.discovery import _reset_result_store, _store_result
+        _reset_result_store()
+        # Stored against database "[db-A]" in system 1.
+        _store_result(
+            "Flight Date",
+            "[-hub-][field][date]",
+            ems_system_id=1,
+            database_id="[db-A]",
+        )
+
+        # Same system but a different database -- must error, not coerce.
+        result = await _query_database(
+            ems_system_id=1,
+            database_id="[db-B]",
+            fields=[{"field_id": 0}],
+        )
+        assert "Error resolving field" in result
+        assert "different database" in result
+
+    @pytest.mark.asyncio
     async def test_entity_type_db_field_name_resolution(self) -> None:
         """Field names on entity-type databases should use BFS fallback."""
         mock_client = MagicMock()

@@ -145,7 +145,11 @@ class TokenManager:
                     )
                     return cached
 
-                elif response.status_code == 400:
+                elif response.status_code in (400, 401):
+                    # Some EMS deployments respond 401 instead of 400 for bad
+                    # credentials; treat both as auth failures and surface the
+                    # OAuth error body when present so the caller sees
+                    # "invalid_grant: ..." rather than "Unexpected response".
                     try:
                         error_data = OAuthErrorResponse.model_validate(response.json())
                         raise AuthenticationError(
@@ -154,7 +158,7 @@ class TokenManager:
                         )
                     except (ValueError, KeyError):
                         raise AuthenticationError(
-                            f"Authentication failed: {response.text}"
+                            f"Authentication failed ({response.status_code}): {response.text}"
                         ) from None
 
                 else:
@@ -165,8 +169,24 @@ class TokenManager:
         except httpx.RequestError as e:
             raise AuthenticationError(f"Network error during authentication: {e}") from e
 
-    def clear_token(self) -> None:
-        """Clear the cached token, forcing re-authentication on next request."""
+    def clear_token(self, expected_access_token: str | None = None) -> None:
+        """Clear the cached token, forcing re-authentication on next request.
+
+        Args:
+            expected_access_token: If provided, only clear when the cached
+                token's ``access_token`` matches this value. Lets the HTTP
+                client signal "the token I just used got 401'd" without
+                wiping a fresh token that a concurrent request already
+                obtained -- avoiding a thundering-herd of re-authentications
+                when several in-flight requests share an expired token.
+        """
+        if (
+            expected_access_token is not None
+            and self._token is not None
+            and self._token.access_token != expected_access_token
+        ):
+            logger.debug("Token already replaced; skipping clear")
+            return
         self._token = None
         logger.debug("Token cache cleared")
 
