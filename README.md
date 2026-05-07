@@ -1,6 +1,6 @@
 # EMS MCP Server
 
-An MCP (Model Context Protocol) server that provides LLM access to the EMS (Engine Monitoring System) API for flight data analytics.
+An MCP (Model Context Protocol) server that provides LLM access to the EMS (Event Management System) API for flight data analytics.
 
 ## Prerequisites
 
