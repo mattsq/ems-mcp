@@ -600,9 +600,10 @@ class TestQueryFlightAnalytics:
                 analytics=["[-hub-][a1]", "[-hub-][a2]"],
             )
 
-        assert "=== Flight 12345 ===" in result
-        assert "a1" in result
-        assert "a2" in result
+        # Default output_format is now 'csv'
+        assert "12345" in result
+        assert "a1" in result or "[-hub-][a1]" in result
+        assert "1000.0" in result
         mock_client.post.assert_called_once()
         call_args = mock_client.post.call_args
         assert "/flights/12345/analytics/query" in call_args[0][0]
@@ -623,8 +624,10 @@ class TestQueryFlightAnalytics:
                 analytics=["[-hub-][alt]"],
             )
 
-        assert "=== Flight 100 ===" in result
-        assert "=== Flight 200 ===" in result
+        # Default output_format is now 'csv'
+        assert "100" in result
+        assert "200" in result
+        assert "500.0" in result
         assert mock_client.post.call_count == 2
 
     @pytest.mark.asyncio
@@ -693,9 +696,11 @@ class TestQueryFlightAnalytics:
                 analytics=["[-hub-][alt]"],
             )
 
-        assert "=== Flight 100 ===" in result
-        assert "=== Flight 200 ===" in result
+        # Default output_format is now 'csv'
+        assert "100" in result
+        assert "200" in result
         assert "Error" in result  # Flight 200 error
+        assert "500.0" in result  # Flight 100 data
         # Should not have the "all failed" prefix
         assert "All" not in result.split("\n")[0]
 
@@ -1116,7 +1121,9 @@ class TestQueryFlightAnalyticsNameResolution:
                 analytics=["[-hub-][field][alt]"],
             )
 
-        assert "=== Flight 100 ===" in result
+        # Default output_format is now 'csv'
+        assert "100" in result
+        assert "1000.0" in result
         # No search calls should have been made
         mock_client.get.assert_not_called()
 
@@ -2002,6 +2009,7 @@ class TestQueryDatabaseFieldResolution:
                 ems_system_id=1,
                 database_id="FDW Flights",
                 fields=[{"field_id": "[f1]"}],
+                apply_best_practice_filters=False,
             )
 
         assert "test" in result
@@ -2114,6 +2122,7 @@ class TestQueryDatabaseFieldResolution:
                 ems_system_id=1,
                 database_id=entity_db,
                 fields=[{"field_id": "Flight Record"}],
+                apply_best_practice_filters=False,
             )
 
         assert "12345" in result

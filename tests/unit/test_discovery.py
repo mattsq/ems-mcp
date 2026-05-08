@@ -111,8 +111,7 @@ class TestFormatters:
             "groups": [],
         }
         result = _format_database_group(group)
-        assert "NOTE: this is a group ID" in result
-        assert "list_databases" in result
+        assert "group - navigate deeper with list_databases" in result
 
     def test_format_database_group_empty(self) -> None:
         """Format empty database group."""

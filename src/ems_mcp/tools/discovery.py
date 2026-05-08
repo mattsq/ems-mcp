@@ -613,14 +613,21 @@ def _format_database_group(group: dict[str, Any]) -> str:
             # Handle both root level (name/description) and nested (pluralName/singularName)
             db_name = db.get("name") or db.get("pluralName") or db.get("singularName", "Unknown")
             desc = db.get("description", "")
-            # Annotate entity-type-group IDs that require further navigation
-            if "[entity-type-group]" in str(db_id):
-                note = " [NOTE: this is a group ID - navigate deeper with list_databases]"
+            db_id_str = str(db_id)
+            # Annotate database type so LLMs can pick the correct find_fields mode.
+            if "[entity-type-group]" in db_id_str:
+                note = " [group - navigate deeper with list_databases]"
                 lines.append(f"  - {db_name} (ID: {db_id}){note}")
+            elif "[entity-type]" in db_id_str:
+                note = " [entity-type: use find_fields(mode='browse' or 'deep')]"
+                if desc:
+                    lines.append(f"  - {db_name}: {desc}{note}")
+                else:
+                    lines.append(f"  - {db_name}{note}")
             elif desc:
-                lines.append(f"  - {db_name}: {desc}")
+                lines.append(f"  - {db_name}: {desc} [searchable: use find_fields(mode='search')]")
             else:
-                lines.append(f"  - {db_name}")
+                lines.append(f"  - {db_name} [searchable: use find_fields(mode='search')]")
 
     # Format subgroups
     groups = group.get("groups", [])
@@ -961,7 +968,15 @@ def _format_deep_search_results(
         if groups_visited > 0 and max_groups > 0:
             msg += f"\n(Searched {groups_visited} group(s), budget: {max_groups})"
             if groups_visited >= max_groups:
-                msg += "\nBudget exhausted -- try increasing max_groups for a wider search."
+                msg += (
+                    "\nBudget exhausted with no matches. Try one of:"
+                    "\n  1. Use find_fields(mode='browse') to navigate the hierarchy first,"
+                    " then scope deep search to that subtree with group_id=N."
+                    "\n  2. Simplify search_text to a single key term (e.g. 'rotation' instead"
+                    " of 'rotation rate high')."
+                    "\n  3. Increase max_groups (up to 500) if you suspect the field is deep"
+                    " in a large subtree."
+                )
         if clamp_note:
             msg += clamp_note
         return msg
@@ -1008,7 +1023,10 @@ def _format_deep_search_results(
     if groups_visited > 0 and max_groups > 0:
         stats = f"\n(Searched {groups_visited} group(s), budget: {max_groups})"
         if groups_visited >= max_groups:
-            stats += "\nBudget exhausted -- try increasing max_groups for a wider search."
+            stats += (
+                "\nBudget exhausted -- more matches may exist. Increase max_groups or scope"
+                " the search with group_id=N (from a prior browse) to search a subtree."
+            )
         lines.append(stats)
     if clamp_note:
         lines.append(clamp_note)
