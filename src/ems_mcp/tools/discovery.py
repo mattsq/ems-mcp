@@ -101,6 +101,7 @@ def _store_result(
     result_type: str = "field",
     ems_system_id: int | None = None,
     database_id: str | None = None,
+    path: str | None = None,
 ) -> int:
     """Store a result and return its reference number.
 
@@ -116,6 +117,11 @@ def _store_result(
             name-based lookups; analytic entries only need this.
         database_id: Database the result belongs to (fields only). Used to
             prevent cross-database name collisions in lookup.
+        path: Breadcrumb path for the field (e.g. "Profiles > QFA Shared >
+            P437: ... > Event Information"). Set by deep search; ``None``
+            when the path is not known (search/browse mode). Used by
+            ``suggest_query_filters`` for path-authoritative profile/event
+            detection.
 
     Returns:
         The reference number assigned to this result.
@@ -130,6 +136,7 @@ def _store_result(
         "type": result_type,
         "ems_system_id": ems_system_id,
         "database_id": database_id,
+        "path": path,
     }
 
     # Evict oldest entries when over capacity
@@ -192,6 +199,74 @@ def _reset_result_store() -> None:
     global _next_ref  # noqa: PLW0603
     _result_store.clear()
     _next_ref = 0
+
+
+def _lookup_stored_field(
+    field_ref: str | int,
+    ems_system_id: int,
+    database_id: str,
+) -> dict[str, Any] | None:
+    """Best-effort lookup of a stored field entry for a given reference.
+
+    Tries (in order): numeric/[N] ref, exact id match, exact name match
+    scoped to (ems_system_id, database_id). Returns the stored entry dict
+    (containing ``name``, ``id``, ``path`` etc.) when a single match is
+    found, else ``None``.
+
+    Used by ``suggest_query_filters`` to recover path metadata that the
+    agent saw during ``find_fields(mode="deep")`` -- so rules can use the
+    authoritative path rather than the name regex fallback.
+    """
+    if isinstance(field_ref, int) or (
+        isinstance(field_ref, str) and field_ref.strip().isdigit()
+    ):
+        ref_num = int(field_ref) if isinstance(field_ref, str) else field_ref
+        entry = _get_stored_result(ref_num)
+        if entry is not None and entry.get("type") == "field":
+            return entry
+        return None
+
+    if not isinstance(field_ref, str):
+        return None
+
+    field_ref = field_ref.strip()
+    if not field_ref:
+        return None
+
+    # Strip [N] display form to bare digits if it sneaks in here.
+    if (
+        len(field_ref) >= 3
+        and field_ref.startswith("[")
+        and field_ref.endswith("]")
+        and field_ref[1:-1].isdigit()
+    ):
+        return _get_stored_result(int(field_ref[1:-1]))
+
+    # Bracket-encoded id -> exact id match in the store
+    if field_ref.startswith("["):
+        for entry in _result_store.values():
+            if (
+                entry.get("type") == "field"
+                and entry.get("id") == field_ref
+                and entry.get("ems_system_id") == ems_system_id
+                and entry.get("database_id") == database_id
+            ):
+                return entry
+        return None
+
+    # Otherwise treat as a name; look up case-insensitively scoped to ems+db
+    name_lower = field_ref.lower()
+    matches = [
+        entry
+        for entry in _result_store.values()
+        if entry.get("type") == "field"
+        and entry.get("name", "").lower() == name_lower
+        and entry.get("ems_system_id") == ems_system_id
+        and entry.get("database_id") == database_id
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    return None
 
 
 def _resolve_group_id_ref(group_ref: str | int | None) -> str | None:
@@ -891,6 +966,7 @@ def _format_deep_search_results(
             ref = _store_result(
                 field_name, field_id,
                 ems_system_id=ems_system_id, database_id=database_id,
+                path=path,
             )
             lines.append(f"\n  [{ref}] {field_name} [{type_str}]")
             lines.append(f"    Path: {path}")
