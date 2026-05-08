@@ -99,6 +99,17 @@ code-to-label mappings, or pass string labels in filters (auto-resolved).
 find_fields(mode="deep") for BFS traversal, or mode="browse" to navigate.
 - get_assets returns reference data (fleets, aircraft, airports, flight phases).
 - Use search_analytics to find time-series parameter names before querying.
+
+QUERY BEST PRACTICES (apply unless the user opts out):
+- Profile fields (names matching "P{N}: ..."): add Processing State == \
+"Succeeded". For event fields (path contains "Event Information"): also add \
+False Positive == "Not a False Positive".
+- FDW Flights queries: add Takeoff Valid == true AND Landing Valid == true.
+- Fleet vs Fleet Group vs Airline Fleet Group: state which one you used. \
+"Fleet" is the recorder type; FDR_* values are FDR downloads, where you \
+should also add Duplicate Detection (Master) == "Not a Duplicate".
+- Call suggest_query_filters before query_database to get rules resolved \
+for your specific query.
 """,
     lifespan=lifespan,
 )

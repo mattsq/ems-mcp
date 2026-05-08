@@ -16,7 +16,11 @@ from fastmcp import Context
 from ems_mcp.api.client import EMSAPIError, EMSNotFoundError
 from ems_mcp.cache import field_cache, make_cache_key
 from ems_mcp.server import get_client, mcp
-from ems_mcp.tools.discovery import _resolve_database_id, _resolve_field_id
+from ems_mcp.tools.discovery import (
+    _lookup_stored_field,
+    _resolve_database_id,
+    _resolve_field_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -998,6 +1002,14 @@ async def query_database(
     Supports aggregation (avg/count/max/min/stdev/sum/var) and discrete filter
     auto-resolution (string labels resolved to numeric codes automatically).
 
+    BEST PRACTICES (apply unless the user opts out): for profile fields
+    ("P{N}: ..."), filter Processing State == "Succeeded"; for profile event
+    fields, also False Positive == "Not a False Positive"; for FDW Flights
+    queries, Takeoff Valid == true AND Landing Valid == true; when filtering
+    Fleet by FDR_* values, also Duplicate Detection (Master) == "Not a
+    Duplicate". Call ``suggest_query_filters`` first to get rules resolved
+    for your specific query.
+
     Args:
         ems_system_id: EMS system ID.
         database_id: Database ID or name (e.g. "FDW Flights").
@@ -1262,3 +1274,372 @@ async def query_flight_analytics(
         )
 
     return formatter(results, analytic_names=display_names)
+
+
+# ---------------------------------------------------------------------------
+# Query best-practice suggestions
+# ---------------------------------------------------------------------------
+#
+# These constants encode generalizable EMS conventions for query filters
+# that callers should apply by default. They are surfaced to the agent via
+# the suggest_query_filters tool below and the QUERY BEST PRACTICES block
+# in the server instructions. Override semantics: rules are skipped when
+# the caller has already filtered the same field, so an explicit user
+# choice (e.g. Takeoff Valid == false) is never overruled.
+
+# Profile fields are named "P{N}: ..." in EMS deployments. Path-based
+# detection (a field whose path contains "Profiles/") is preferred when
+# available; the regex is the fallback when only a name is known.
+_PROFILE_NAME_PREFIX = re.compile(r"^P(\d+):\s*", re.IGNORECASE)
+
+# Canonical label spellings. Discrete-value resolution is case-insensitive,
+# but we emit canonical casing so the agent's narrative reads correctly.
+_PROCESSING_STATE_OK = "Succeeded"
+_FALSE_POSITIVE_OK = "Not a False Positive"
+_DUPLICATE_DETECTION_OK = "Not a Duplicate"
+
+# Fleet-like fields the agent should disambiguate explicitly.
+_FLEET_LIKE_FIELDS = {"Fleet", "Fleet Group", "Airline Fleet Group", "Airframe Group"}
+
+
+def _profile_number(name: str) -> str | None:
+    """Extract the profile prefix (e.g. ``"P437"``) from a field name.
+
+    Returns the matched prefix (without trailing colon/space) or None.
+    """
+    if not name:
+        return None
+    m = _PROFILE_NAME_PREFIX.match(name)
+    if m is None:
+        return None
+    return f"P{m.group(1)}"
+
+
+def _is_profile_event_field(name: str | None, path: str | None) -> bool:
+    """True if a field belongs to a profile's Event Information group.
+
+    Path is authoritative; a field whose path contains ``Event Information``
+    under a ``Profiles`` subtree is an event field. Falls back to a
+    name-based heuristic only when path is unknown.
+    """
+    if path:
+        path_lower = path.lower()
+        if "event information" in path_lower and "profiles" in path_lower:
+            return True
+        return False
+    # No path info -- can't disambiguate event vs measurement reliably from
+    # the name alone, so default to False (rule B is suppressed without
+    # path evidence; rule A still fires from the name regex).
+    return False
+
+
+def _is_profile_field(name: str | None, path: str | None) -> bool:
+    """True if a field appears to belong to an EMS profile.
+
+    Uses path when available (path contains ``Profiles/``); falls back to
+    the ``^P\\d+:`` name regex otherwise.
+    """
+    if path and "profiles" in path.lower():
+        return True
+    if name and _profile_number(name) is not None:
+        return True
+    return False
+
+
+def _existing_filter_field_names(
+    filters: list[QueryFilter] | None,
+    ems_system_id: int,
+    database_id: str,
+) -> set[str]:
+    """Best-effort: collect canonical names of fields already filtered.
+
+    Used by rules to avoid re-suggesting filters the user already set.
+    Names are looked up from the result store when the filter references a
+    [N] number; passed-through name strings are taken as-is.
+    """
+    if not filters:
+        return set()
+    names: set[str] = set()
+    for f in filters:
+        ref = f.get("field_id")
+        if ref is None:
+            continue
+        entry = _lookup_stored_field(ref, ems_system_id, database_id)
+        if entry is not None and entry.get("name"):
+            names.add(str(entry["name"]))
+        elif isinstance(ref, str) and not ref.startswith("["):
+            names.add(ref)
+    return names
+
+
+def _filter_targets_fleet_with_fdr(
+    filters: list[QueryFilter] | None,
+    ems_system_id: int,
+    database_id: str,
+) -> bool:
+    """True if any filter targets the ``Fleet`` field with an ``FDR_*`` value.
+
+    Detects rule E: when filtering by Fleet on a recorder type whose label
+    starts ``FDR_``, the same flight may have a separate QAR record and
+    should be deduped via Duplicate Detection (Master).
+    """
+    if not filters:
+        return False
+    for f in filters:
+        ref = f.get("field_id")
+        if ref is None:
+            continue
+        # Identify the field as "Fleet" -- check the literal name first,
+        # then fall back to a stored entry's name.
+        is_fleet = False
+        if isinstance(ref, str) and ref.lower() == "fleet":
+            is_fleet = True
+        else:
+            entry = _lookup_stored_field(ref, ems_system_id, database_id)
+            if entry is not None and str(entry.get("name", "")).lower() == "fleet":
+                is_fleet = True
+        if not is_fleet:
+            continue
+
+        value = f.get("value")
+        candidates: list[Any] = []
+        if isinstance(value, (list, tuple)):
+            candidates.extend(value)
+        else:
+            candidates.append(value)
+        for v in candidates:
+            if isinstance(v, str) and v.upper().startswith("FDR_"):
+                return True
+    return False
+
+
+def _format_suggestion_block(
+    rule_id: str,
+    rule_title: str,
+    rationale: str,
+    suggestions: list[dict[str, Any]],
+) -> str:
+    """Render one rule's suggestions in the canonical text format."""
+    lines = [f"[{rule_id}] {rule_title}", f"  {rationale}"]
+    for s in suggestions:
+        operator = s.get("operator", "equal")
+        value = s.get("value")
+        value_repr = repr(value) if not isinstance(value, bool) else str(value)
+        lines.append(
+            f"  - field_id: {s['field_id']!r}, operator: {operator!r}, "
+            f"value: {value_repr}"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool
+async def suggest_query_filters(
+    ems_system_id: int,
+    database_id: str,
+    fields: list[str | int],
+    existing_filters: list[QueryFilter] | None = None,
+    ctx: Context | None = None,
+) -> str:
+    """Suggest best-practice filters for a planned query_database call.
+
+    Returns canonical EMS query conventions resolved for the specific
+    fields you intend to query: profile Processing State == "Succeeded",
+    profile event False Positive == "Not a False Positive", FDW Flights
+    Takeoff Valid / Landing Valid == true, and FDR-fleet duplicate
+    detection. Suggestions skip any field already covered by
+    ``existing_filters`` so explicit user choices are never overruled.
+
+    Call this before query_database. Field references accept the same
+    forms as query_database (name, [N] reference, bracket-encoded ID).
+    Path-based profile detection requires fields that were discovered via
+    find_fields(mode='deep') in this session; otherwise falls back to
+    name-pattern heuristics ("P{N}: ...").
+
+    Args:
+        ems_system_id: EMS system ID.
+        database_id: Database ID or name (e.g. "FDW Flights").
+        fields: Field references planned for the query (names, [N], or IDs).
+        existing_filters: Filters already on the query, so the tool can
+            skip re-suggesting them. Same shape as query_database.filters.
+
+    Returns:
+        Formatted text listing applicable suggestions per rule, ending
+        with a ready-to-paste filter block; or a single line stating no
+        suggestions apply.
+    """
+    if not fields:
+        return (
+            "Error: At least one field reference is required. Pass the same "
+            "field references you plan to give to query_database."
+        )
+
+    # Resolve database -- needed to identify FDW Flights and to scope store lookups.
+    try:
+        resolved_db = await _resolve_database_id(database_id, ems_system_id)
+    except ValueError as e:
+        return f"Error resolving database: {e}"
+
+    # Gather (name, path) tuples for each queried field. Best-effort: store
+    # lookups give name+path for fields the agent saw via find_fields. For
+    # bare strings that aren't in the store, treat the string as the name.
+    field_infos: list[tuple[str | None, str | None]] = []
+    for ref in fields:
+        entry = _lookup_stored_field(ref, ems_system_id, resolved_db)
+        if entry is not None:
+            field_infos.append((entry.get("name"), entry.get("path")))
+        elif isinstance(ref, str) and ref.strip() and not ref.strip().startswith("["):
+            field_infos.append((ref.strip(), None))
+        else:
+            field_infos.append((None, None))
+
+    # Identify already-filtered field names so we can suppress duplicate suggestions.
+    filtered_names = _existing_filter_field_names(
+        existing_filters, ems_system_id, resolved_db
+    )
+    filtered_names_lower = {n.lower() for n in filtered_names}
+
+    sections: list[str] = []
+    bundle: list[dict[str, Any]] = []
+
+    # --- Rule A: Profile measurement -- Processing State == Succeeded ---
+    # --- Rule B: Profile event -- also False Positive == Not a False Positive ---
+    profiles_in_query: list[str] = []
+    profiles_with_event_field: set[str] = set()
+    seen_profile: set[str] = set()
+    for name, path in field_infos:
+        if not _is_profile_field(name, path):
+            continue
+        prof = _profile_number(name) if name else None
+        if not prof:
+            # Path-only detection without a recoverable profile number --
+            # we can't construct the "P{N}: Processing State" filter
+            # without the number, so skip with a soft note later.
+            continue
+        if prof not in seen_profile:
+            seen_profile.add(prof)
+            profiles_in_query.append(prof)
+        if _is_profile_event_field(name, path):
+            profiles_with_event_field.add(prof)
+
+    rule_a_suggestions: list[dict[str, Any]] = []
+    rule_b_suggestions: list[dict[str, Any]] = []
+    for prof in profiles_in_query:
+        ps_field = f"{prof}: Processing State"
+        if ps_field.lower() not in filtered_names_lower:
+            rule_a_suggestions.append({
+                "field_id": ps_field,
+                "operator": "equal",
+                "value": _PROCESSING_STATE_OK,
+            })
+        if prof in profiles_with_event_field:
+            fp_field = f"{prof}: False Positive"
+            if fp_field.lower() not in filtered_names_lower:
+                rule_b_suggestions.append({
+                    "field_id": fp_field,
+                    "operator": "equal",
+                    "value": _FALSE_POSITIVE_OK,
+                })
+
+    if rule_a_suggestions:
+        sections.append(_format_suggestion_block(
+            "A", "Profile Processing State",
+            "Restrict to flights where the profile finished processing "
+            "successfully.",
+            rule_a_suggestions,
+        ))
+        bundle.extend(rule_a_suggestions)
+    if rule_b_suggestions:
+        sections.append(_format_suggestion_block(
+            "B", "Profile event False Positive",
+            "Exclude events that reviewers flagged as false positives.",
+            rule_b_suggestions,
+        ))
+        bundle.extend(rule_b_suggestions)
+
+    # --- Rule C: FDW Flights validity ---
+    is_fdw_flights = "foqa-flights" in resolved_db.lower()
+    rule_c_suggestions: list[dict[str, Any]] = []
+    if is_fdw_flights:
+        for fname in ("Takeoff Valid", "Landing Valid"):
+            if fname.lower() not in filtered_names_lower:
+                rule_c_suggestions.append({
+                    "field_id": fname,
+                    "operator": "equal",
+                    "value": True,
+                })
+    if rule_c_suggestions:
+        sections.append(_format_suggestion_block(
+            "C", "FDW Flights validity",
+            "Exclude flights without valid takeoff/landing detection so "
+            "aggregates are not skewed by partial records.",
+            rule_c_suggestions,
+        ))
+        bundle.extend(rule_c_suggestions)
+
+    # --- Rule D: Fleet ambiguity (informational only) ---
+    referenced_fleet_like: list[str] = []
+    for name, _ in field_infos:
+        if name and name in _FLEET_LIKE_FIELDS:
+            if name not in referenced_fleet_like:
+                referenced_fleet_like.append(name)
+    if existing_filters:
+        for f in existing_filters:
+            ref = f.get("field_id")
+            candidate_name: str | None = None
+            if isinstance(ref, str) and not ref.startswith("[") and not ref.isdigit():
+                candidate_name = ref
+            else:
+                entry = _lookup_stored_field(ref, ems_system_id, resolved_db) if ref is not None else None
+                if entry is not None:
+                    candidate_name = entry.get("name")
+            if candidate_name in _FLEET_LIKE_FIELDS and candidate_name not in referenced_fleet_like:
+                referenced_fleet_like.append(candidate_name)
+
+    if referenced_fleet_like:
+        sections.append(
+            "[D] Fleet field disambiguation\n"
+            f"  Your query references: {', '.join(referenced_fleet_like)}.\n"
+            "  These fields are NOT interchangeable -- be explicit in your\n"
+            "  narrative which one was used:\n"
+            '    - "Fleet": flight-recorder type (FDR_* are FDR downloads).\n'
+            '    - "Fleet Group": aircraft model (e.g. "737-800", "A330-200").\n'
+            '    - "Airline Fleet Group": operator-specific code (e.g. "QFB738").\n'
+            '    - "Airframe Group": airframe-level grouping.'
+        )
+
+    # --- Rule E: FDR duplicate detection ---
+    rule_e_suggestions: list[dict[str, Any]] = []
+    if _filter_targets_fleet_with_fdr(existing_filters, ems_system_id, resolved_db):
+        if "duplicate detection (master)" not in filtered_names_lower:
+            rule_e_suggestions.append({
+                "field_id": "Duplicate Detection (Master)",
+                "operator": "equal",
+                "value": _DUPLICATE_DETECTION_OK,
+            })
+    if rule_e_suggestions:
+        sections.append(_format_suggestion_block(
+            "E", "FDR duplicate detection",
+            "Filter targets a Fleet recorder starting FDR_, where the same "
+            "flight may also have a QAR record. Deduplicate via Duplicate "
+            "Detection (Master).",
+            rule_e_suggestions,
+        ))
+        bundle.extend(rule_e_suggestions)
+
+    if not sections:
+        return "No best-practice filter suggestions for this query."
+
+    output = ["Best-practice filter suggestions:\n"]
+    output.append("\n\n".join(sections))
+    if bundle:
+        output.append(
+            "\n\nReady-to-use filters block (paste into query_database "
+            "as ``filters=...``, with your existing filters):\n"
+            + repr(bundle)
+        )
+    output.append(
+        "\n\nApply these unless the user explicitly asked you to skip them. "
+        "Field names auto-resolve in query_database; canonical discrete labels "
+        "(e.g. \"Succeeded\") resolve to numeric codes automatically."
+    )
+    return "".join(output)

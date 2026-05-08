@@ -24,11 +24,13 @@ from ems_mcp.tools.query import (
     _resolve_filters,
     query_database,
     query_flight_analytics,
+    suggest_query_filters,
 )
 
 # Access the underlying functions from the FastMCP FunctionTool wrappers
 _query_database = query_database.fn
 _query_flight_analytics = query_flight_analytics.fn
+_suggest_query_filters = suggest_query_filters.fn
 
 
 class TestBuildSingleFilter:
@@ -2139,3 +2141,277 @@ class TestQueryDatabaseFieldResolution:
             )
 
         assert "Error resolving field" in result
+
+
+class TestSuggestQueryFilters:
+    """Tests for suggest_query_filters tool."""
+
+    FDW_FLIGHTS_ID = "[ems-core][entity-type][foqa-flights]"
+    NON_FLIGHTS_ID = "[ems-core][entity-type][some-other-entity]"
+
+    @pytest.fixture(autouse=True)
+    def reset_store(self) -> None:
+        from ems_mcp.tools.discovery import _reset_result_store
+        _reset_result_store()
+
+    def _store_field(
+        self,
+        name: str,
+        path: str | None = None,
+        ems_system_id: int = 1,
+        database_id: str = FDW_FLIGHTS_ID,
+        field_id: str | None = None,
+    ) -> int:
+        from ems_mcp.tools.discovery import _store_result
+        return _store_result(
+            name,
+            field_id or f"[fld][{name.lower().replace(' ', '-')}]",
+            ems_system_id=ems_system_id,
+            database_id=database_id,
+            path=path,
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_fields_validation(self) -> None:
+        """Tool should reject empty field list."""
+        result = await _suggest_query_filters(
+            ems_system_id=1,
+            database_id=self.FDW_FLIGHTS_ID,
+            fields=[],
+        )
+        assert "Error" in result
+
+    @pytest.mark.asyncio
+    async def test_rule_a_profile_processing_state(self) -> None:
+        """Rule A: profile measurement field triggers Processing State suggestion."""
+        result = await _suggest_query_filters(
+            ems_system_id=1,
+            database_id=self.NON_FLIGHTS_ID,
+            fields=["P437: Some Measurement"],
+        )
+        assert "[A]" in result
+        assert "P437: Processing State" in result
+        assert "Succeeded" in result
+        # Without Event Information path, rule B must NOT fire.
+        assert "[B]" not in result
+        assert "False Positive" not in result
+
+    @pytest.mark.asyncio
+    async def test_rule_b_profile_event_field_via_path(self) -> None:
+        """Rule B: profile event field path triggers False Positive suggestion."""
+        ref = self._store_field(
+            "P437: Event Record",
+            path="Profiles > QFA Shared > P437: QL Taxi > Event Information",
+            database_id=self.NON_FLIGHTS_ID,
+        )
+        result = await _suggest_query_filters(
+            ems_system_id=1,
+            database_id=self.NON_FLIGHTS_ID,
+            fields=[ref],
+        )
+        # Both rules A and B should fire (event implies processing state too).
+        assert "[A]" in result
+        assert "P437: Processing State" in result
+        assert "[B]" in result
+        assert "P437: False Positive" in result
+        assert "Not a False Positive" in result
+
+    @pytest.mark.asyncio
+    async def test_rule_c_fdw_flights_validity(self) -> None:
+        """Rule C: FDW Flights query suggests Takeoff Valid + Landing Valid."""
+        result = await _suggest_query_filters(
+            ems_system_id=1,
+            database_id=self.FDW_FLIGHTS_ID,
+            fields=["Flight Date"],
+        )
+        assert "[C]" in result
+        assert "Takeoff Valid" in result
+        assert "Landing Valid" in result
+        # Both should appear with value True.
+        assert "True" in result
+
+    @pytest.mark.asyncio
+    async def test_rule_c_skipped_for_non_flights_database(self) -> None:
+        """Rule C: non-flights database does NOT trigger validity suggestion."""
+        result = await _suggest_query_filters(
+            ems_system_id=1,
+            database_id=self.NON_FLIGHTS_ID,
+            fields=["Some Field"],
+        )
+        assert "Takeoff Valid" not in result
+        assert "Landing Valid" not in result
+
+    @pytest.mark.asyncio
+    async def test_rule_d_fleet_ambiguity_note(self) -> None:
+        """Rule D: queries referencing Fleet emit informational disambiguation."""
+        result = await _suggest_query_filters(
+            ems_system_id=1,
+            database_id=self.FDW_FLIGHTS_ID,
+            fields=["Fleet"],
+        )
+        assert "[D]" in result
+        # Must mention the alternatives.
+        assert "Fleet Group" in result
+        assert "Airline Fleet Group" in result
+        # Rule D is informational -- no concrete filter for Fleet itself.
+        assert "FDR_" in result or "recorder" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_rule_e_fdr_duplicate_detection(self) -> None:
+        """Rule E: filtering Fleet by FDR_* values suggests Duplicate Detection."""
+        result = await _suggest_query_filters(
+            ems_system_id=1,
+            database_id=self.FDW_FLIGHTS_ID,
+            fields=["Flight Date"],
+            existing_filters=[
+                {"field_id": "Fleet", "operator": "equal",
+                 "value": "FDR_QFA - 737-838 (3C)"},
+            ],
+        )
+        assert "[E]" in result
+        assert "Duplicate Detection (Master)" in result
+        assert "Not a Duplicate" in result
+
+    @pytest.mark.asyncio
+    async def test_rule_e_fdr_in_list_value(self) -> None:
+        """Rule E: ``in`` filter with any FDR_* value also fires."""
+        result = await _suggest_query_filters(
+            ems_system_id=1,
+            database_id=self.FDW_FLIGHTS_ID,
+            fields=["Flight Date"],
+            existing_filters=[
+                {"field_id": "Fleet", "operator": "in",
+                 "value": ["EFA - 737-300 (737-4A)", "FDR_QFA - 747-400 GE"]},
+            ],
+        )
+        assert "[E]" in result
+        assert "Duplicate Detection (Master)" in result
+
+    @pytest.mark.asyncio
+    async def test_rule_e_no_fdr_values(self) -> None:
+        """Rule E: Fleet filter without FDR_* values does NOT trigger rule E."""
+        result = await _suggest_query_filters(
+            ems_system_id=1,
+            database_id=self.FDW_FLIGHTS_ID,
+            fields=["Flight Date"],
+            existing_filters=[
+                {"field_id": "Fleet", "operator": "equal",
+                 "value": "EFA - A330-200 (00004)"},
+            ],
+        )
+        assert "[E]" not in result
+        assert "Duplicate Detection" not in result
+
+    @pytest.mark.asyncio
+    async def test_idempotence_takeoff_valid_already_filtered(self) -> None:
+        """Existing Takeoff Valid filter suppresses Rule C for that field."""
+        result = await _suggest_query_filters(
+            ems_system_id=1,
+            database_id=self.FDW_FLIGHTS_ID,
+            fields=["Flight Date"],
+            existing_filters=[
+                {"field_id": "Takeoff Valid", "operator": "equal", "value": False},
+            ],
+        )
+        # Takeoff Valid suggestion must NOT appear (user explicitly chose false).
+        # But Landing Valid should still be suggested.
+        assert "Landing Valid" in result
+        # The line that suggests Takeoff Valid should not be present.
+        # Walk the suggestion lines and ensure none re-suggest Takeoff Valid.
+        for line in result.splitlines():
+            if line.strip().startswith("- field_id:") and "Takeoff Valid" in line:
+                pytest.fail(
+                    f"Rule C should not re-suggest Takeoff Valid: {line!r}"
+                )
+
+    @pytest.mark.asyncio
+    async def test_idempotence_processing_state_already_filtered(self) -> None:
+        """Existing Processing State filter suppresses Rule A for that profile."""
+        result = await _suggest_query_filters(
+            ems_system_id=1,
+            database_id=self.NON_FLIGHTS_ID,
+            fields=["P437: Some Measurement"],
+            existing_filters=[
+                {"field_id": "P437: Processing State", "operator": "equal",
+                 "value": "Succeeded"},
+            ],
+        )
+        # Should not re-suggest the same filter.
+        for line in result.splitlines():
+            if (
+                line.strip().startswith("- field_id:")
+                and "P437: Processing State" in line
+            ):
+                pytest.fail(f"Should not re-suggest: {line!r}")
+
+    @pytest.mark.asyncio
+    async def test_no_op_returns_clean_message(self) -> None:
+        """No applicable rules -> single-line clean message."""
+        result = await _suggest_query_filters(
+            ems_system_id=1,
+            database_id=self.NON_FLIGHTS_ID,
+            fields=["Some Random Field"],
+        )
+        assert result == "No best-practice filter suggestions for this query."
+
+    @pytest.mark.asyncio
+    async def test_multi_profile_emits_separate_suggestions(self) -> None:
+        """Multiple profiles -> separate Processing State suggestions per profile."""
+        result = await _suggest_query_filters(
+            ems_system_id=1,
+            database_id=self.NON_FLIGHTS_ID,
+            fields=["P100: First Measurement", "P200: Second Measurement"],
+        )
+        assert "P100: Processing State" in result
+        assert "P200: Processing State" in result
+
+    @pytest.mark.asyncio
+    async def test_event_field_without_path_falls_back_to_a_only(self) -> None:
+        """Without path info, profile field can only trigger rule A (not B)."""
+        # Fields passed by name alone (no store entry) have no path.
+        result = await _suggest_query_filters(
+            ems_system_id=1,
+            database_id=self.NON_FLIGHTS_ID,
+            fields=["P437: False Positive"],  # Looks like an event field by name
+        )
+        # Rule A fires (profile detected by name regex).
+        assert "P437: Processing State" in result
+        # Rule B does NOT fire without path evidence -- can't tell event
+        # from measurement by name alone.
+        assert "[B]" not in result
+
+    @pytest.mark.asyncio
+    async def test_ready_to_use_filter_block_present(self) -> None:
+        """Output should include a ready-to-use bundle when suggestions exist."""
+        result = await _suggest_query_filters(
+            ems_system_id=1,
+            database_id=self.FDW_FLIGHTS_ID,
+            fields=["Flight Date"],
+        )
+        assert "Ready-to-use filters block" in result
+        # Should include the canonical Python repr of the suggestion list.
+        assert "'Takeoff Valid'" in result
+        assert "'Landing Valid'" in result
+
+    @pytest.mark.asyncio
+    async def test_path_authoritative_over_name_for_event_detection(self) -> None:
+        """Path info beats name regex: a field with non-event path under
+        Profiles is treated as a measurement, not an event."""
+        ref_meas = self._store_field(
+            "P437: False Positive Count",
+            # Note: this path is NOT an Event Information group -- it lives
+            # under Measured Items even though the name superficially
+            # resembles an event-field name.
+            path="Profiles > QFA Shared > P437: QL Taxi > Measured Items",
+            database_id=self.NON_FLIGHTS_ID,
+        )
+        result = await _suggest_query_filters(
+            ems_system_id=1,
+            database_id=self.NON_FLIGHTS_ID,
+            fields=[ref_meas],
+        )
+        # Rule A fires (profile field).
+        assert "P437: Processing State" in result
+        # Rule B does NOT fire -- path says Measured Items, not Event
+        # Information.
+        assert "[B]" not in result
