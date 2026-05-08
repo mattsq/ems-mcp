@@ -991,6 +991,7 @@ async def query_database(
     limit: int = 100,
     format: str = "display",
     output_format: str = "table",
+    apply_best_practice_filters: bool = True,
     ctx: Context | None = None,
 ) -> str:
     """Query flight records from a database.
@@ -1002,13 +1003,12 @@ async def query_database(
     Supports aggregation (avg/count/max/min/stdev/sum/var) and discrete filter
     auto-resolution (string labels resolved to numeric codes automatically).
 
-    BEST PRACTICES (apply unless the user opts out): for profile fields
-    ("P{N}: ..."), filter Processing State == "Succeeded"; for profile event
-    fields, also False Positive == "Not a False Positive"; for FDW Flights
-    queries, Takeoff Valid == true AND Landing Valid == true; when filtering
-    Fleet by FDR_* values, also Duplicate Detection (Master) == "Not a
-    Duplicate". Call ``suggest_query_filters`` first to get rules resolved
-    for your specific query.
+    Best-practice filters are applied automatically (apply_best_practice_filters=True
+    by default): FDW Flights gets Takeoff Valid == true AND Landing Valid == true;
+    profile fields get Processing State == "Succeeded"; profile event fields also
+    get False Positive == "Not a False Positive". User-provided filters always
+    take precedence over auto-suggested ones. Set apply_best_practice_filters=False
+    to disable (e.g. when explicitly querying invalid flights).
 
     Args:
         ems_system_id: EMS system ID.
@@ -1021,6 +1021,8 @@ async def query_database(
         limit: Max rows (1-10000, default: 100).
         format: 'display' (human-readable, default) or 'raw' (numeric codes).
         output_format: 'table' (default), 'csv' (compact), or 'json' (structured).
+        apply_best_practice_filters: Auto-apply EMS data quality filters (default:
+            True). User filters always override auto-suggested ones.
 
     Returns:
         Results in the requested output format.
@@ -1061,6 +1063,19 @@ async def query_database(
         database_id = await _resolve_database_id(database_id, ems_system_id)
     except ValueError as e:
         return f"Error resolving database: {e}"
+
+    # Auto-apply best-practice filters unless the caller opted out.
+    # We do this before field resolution so the original [N] references and
+    # field names are still available for result-store lookups.
+    if apply_best_practice_filters:
+        field_refs = [f["field_id"] for f in fields]
+        bp_bundle, _ = _compute_best_practice_filter_bundle(
+            ems_system_id, database_id, field_refs, filters
+        )
+        if bp_bundle:
+            # Prepend best-practice filters; user filters follow so they
+            # always override auto-suggested ones for the same field.
+            filters = bp_bundle + (filters or [])
 
     # Resolve field references -> opaque IDs
     try:
@@ -1162,7 +1177,7 @@ async def query_flight_analytics(
     start_offset: float | None = None,
     end_offset: float | None = None,
     sample_rate: float = 1.0,
-    output_format: str = "table",
+    output_format: str = "csv",
     ctx: Context | None = None,
 ) -> str:
     """Get time-series data (altitude, airspeed, etc.) for specific flights.
@@ -1178,7 +1193,8 @@ async def query_flight_analytics(
         start_offset: Start time in seconds from flight start.
         end_offset: End time in seconds from flight start.
         sample_rate: Samples per second (default: 1.0).
-        output_format: 'table' (default), 'csv' (compact), or 'json' (structured).
+        output_format: 'csv' (default, compact), 'table' (human-readable), or
+            'json' (structured).
 
     Returns:
         Per-flight time-series data in the requested output format.
@@ -1432,56 +1448,24 @@ def _format_suggestion_block(
     return "\n".join(lines)
 
 
-@mcp.tool
-async def suggest_query_filters(
+def _compute_best_practice_filter_bundle(
     ems_system_id: int,
-    database_id: str,
+    resolved_db: str,
     fields: list[str | int],
-    existing_filters: list[QueryFilter] | None = None,
-    ctx: Context | None = None,
-) -> str:
-    """Suggest best-practice filters for a planned query_database call.
+    existing_filters: list[QueryFilter] | None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Compute best-practice filter bundle for the given fields.
 
-    Returns canonical EMS query conventions resolved for the specific
-    fields you intend to query: profile Processing State == "Succeeded",
-    profile event False Positive == "Not a False Positive", FDW Flights
-    Takeoff Valid / Landing Valid == true, and FDR-fleet duplicate
-    detection. Suggestions skip any field already covered by
-    ``existing_filters`` so explicit user choices are never overruled.
+    Returns a tuple of (filter_bundle, informational_sections) where
+    filter_bundle is a list of filter dicts ready for query_database and
+    informational_sections is a list of formatted strings for rules that
+    produce text notes rather than concrete filters (e.g. Rule D).
 
-    Call this before query_database. Field references accept the same
-    forms as query_database (name, [N] reference, bracket-encoded ID).
-    Path-based profile detection requires fields that were discovered via
-    find_fields(mode='deep') in this session; otherwise falls back to
-    name-pattern heuristics ("P{N}: ...").
-
-    Args:
-        ems_system_id: EMS system ID.
-        database_id: Database ID or name (e.g. "FDW Flights").
-        fields: Field references planned for the query (names, [N], or IDs).
-        existing_filters: Filters already on the query, so the tool can
-            skip re-suggesting them. Same shape as query_database.filters.
-
-    Returns:
-        Formatted text listing applicable suggestions per rule, ending
-        with a ready-to-paste filter block; or a single line stating no
-        suggestions apply.
+    This is the shared core used by both suggest_query_filters (which
+    formats the bundle as human-readable text) and query_database (which
+    applies the bundle automatically).
     """
-    if not fields:
-        return (
-            "Error: At least one field reference is required. Pass the same "
-            "field references you plan to give to query_database."
-        )
-
-    # Resolve database -- needed to identify FDW Flights and to scope store lookups.
-    try:
-        resolved_db = await _resolve_database_id(database_id, ems_system_id)
-    except ValueError as e:
-        return f"Error resolving database: {e}"
-
-    # Gather (name, path) tuples for each queried field. Best-effort: store
-    # lookups give name+path for fields the agent saw via find_fields. For
-    # bare strings that aren't in the store, treat the string as the name.
+    # Gather (name, path) tuples for each queried field.
     field_infos: list[tuple[str | None, str | None]] = []
     for ref in fields:
         entry = _lookup_stored_field(ref, ems_system_id, resolved_db)
@@ -1498,8 +1482,8 @@ async def suggest_query_filters(
     )
     filtered_names_lower = {n.lower() for n in filtered_names}
 
-    sections: list[str] = []
     bundle: list[dict[str, Any]] = []
+    info_sections: list[str] = []
 
     # --- Rule A: Profile measurement -- Processing State == Succeeded ---
     # --- Rule B: Profile event -- also False Positive == Not a False Positive ---
@@ -1511,9 +1495,6 @@ async def suggest_query_filters(
             continue
         prof = _profile_number(name) if name else None
         if not prof:
-            # Path-only detection without a recoverable profile number --
-            # we can't construct the "P{N}: Processing State" filter
-            # without the number, so skip with a soft note later.
             continue
         if prof not in seen_profile:
             seen_profile.add(prof)
@@ -1541,7 +1522,7 @@ async def suggest_query_filters(
                 })
 
     if rule_a_suggestions:
-        sections.append(_format_suggestion_block(
+        info_sections.append(_format_suggestion_block(
             "A", "Profile Processing State",
             "Restrict to flights where the profile finished processing "
             "successfully.",
@@ -1549,7 +1530,7 @@ async def suggest_query_filters(
         ))
         bundle.extend(rule_a_suggestions)
     if rule_b_suggestions:
-        sections.append(_format_suggestion_block(
+        info_sections.append(_format_suggestion_block(
             "B", "Profile event False Positive",
             "Exclude events that reviewers flagged as false positives.",
             rule_b_suggestions,
@@ -1568,7 +1549,7 @@ async def suggest_query_filters(
                     "value": True,
                 })
     if rule_c_suggestions:
-        sections.append(_format_suggestion_block(
+        info_sections.append(_format_suggestion_block(
             "C", "FDW Flights validity",
             "Exclude flights without valid takeoff/landing detection so "
             "aggregates are not skewed by partial records.",
@@ -1596,7 +1577,7 @@ async def suggest_query_filters(
                 referenced_fleet_like.append(candidate_name)
 
     if referenced_fleet_like:
-        sections.append(
+        info_sections.append(
             "[D] Fleet field disambiguation\n"
             f"  Your query references: {', '.join(referenced_fleet_like)}.\n"
             "  These fields are NOT interchangeable -- be explicit in your\n"
@@ -1617,7 +1598,7 @@ async def suggest_query_filters(
                 "value": _DUPLICATE_DETECTION_OK,
             })
     if rule_e_suggestions:
-        sections.append(_format_suggestion_block(
+        info_sections.append(_format_suggestion_block(
             "E", "FDR duplicate detection",
             "Filter targets a Fleet recorder starting FDR_, where the same "
             "flight may also have a QAR record. Deduplicate via Duplicate "
@@ -1625,6 +1606,64 @@ async def suggest_query_filters(
             rule_e_suggestions,
         ))
         bundle.extend(rule_e_suggestions)
+
+    return bundle, info_sections
+
+
+@mcp.tool
+async def suggest_query_filters(
+    ems_system_id: int,
+    database_id: str,
+    fields: list[str | int],
+    existing_filters: list[QueryFilter] | None = None,
+    ctx: Context | None = None,
+) -> str:
+    """Suggest best-practice filters for a planned query_database call.
+
+    Returns canonical EMS query conventions resolved for the specific
+    fields you intend to query: profile Processing State == "Succeeded",
+    profile event False Positive == "Not a False Positive", FDW Flights
+    Takeoff Valid / Landing Valid == true, and FDR-fleet duplicate
+    detection. Suggestions skip any field already covered by
+    ``existing_filters`` so explicit user choices are never overruled.
+
+    Field references accept the same forms as query_database (name, [N]
+    reference, bracket-encoded ID). Path-based profile detection requires
+    fields that were discovered via find_fields(mode='deep') in this
+    session; otherwise falls back to name-pattern heuristics ("P{N}: ...").
+
+    Note: query_database calls this automatically when
+    apply_best_practice_filters=True (the default). Use this tool
+    explicitly only when you want to inspect or adjust the suggestions
+    before passing them to query_database.
+
+    Args:
+        ems_system_id: EMS system ID.
+        database_id: Database ID or name (e.g. "FDW Flights").
+        fields: Field references planned for the query (names, [N], or IDs).
+        existing_filters: Filters already on the query, so the tool can
+            skip re-suggesting them. Same shape as query_database.filters.
+
+    Returns:
+        Formatted text listing applicable suggestions per rule, ending
+        with a ready-to-paste filter block; or a single line stating no
+        suggestions apply.
+    """
+    if not fields:
+        return (
+            "Error: At least one field reference is required. Pass the same "
+            "field references you plan to give to query_database."
+        )
+
+    # Resolve database -- needed to identify FDW Flights and to scope store lookups.
+    try:
+        resolved_db = await _resolve_database_id(database_id, ems_system_id)
+    except ValueError as e:
+        return f"Error resolving database: {e}"
+
+    bundle, sections = _compute_best_practice_filter_bundle(
+        ems_system_id, resolved_db, fields, existing_filters
+    )
 
     if not sections:
         return "No best-practice filter suggestions for this query."
