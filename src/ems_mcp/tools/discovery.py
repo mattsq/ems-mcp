@@ -604,6 +604,13 @@ def _format_database_group(group: dict[str, Any]) -> str:
     group_id = group.get("id", "[none]")
     lines.append(f"Group: {group_name} (ID: {group_id})")
 
+    # When the agent has navigated into the APM Events folder, every
+    # database here is an event profile (P14, P40, P600, ...). Field-name
+    # search will not find specific event names -- they live as discrete
+    # values inside each profile's Event Type field. Flag the DBs so the
+    # agent is pointed at the dedicated workflow.
+    is_apm_events = (group_name or "").strip().lower() == _APM_GROUP_NAME
+
     # Format databases
     databases = group.get("databases", [])
     if databases:
@@ -614,20 +621,29 @@ def _format_database_group(group: dict[str, Any]) -> str:
             db_name = db.get("name") or db.get("pluralName") or db.get("singularName", "Unknown")
             desc = db.get("description", "")
             db_id_str = str(db_id)
+            event_profile_note = (
+                " [event-profile - use list_event_profiles + find_event_types "
+                "to search specific event names]"
+            ) if is_apm_events else ""
             # Annotate database type so LLMs can pick the correct find_fields mode.
             if "[entity-type-group]" in db_id_str:
                 note = " [group - navigate deeper with list_databases]"
                 lines.append(f"  - {db_name} (ID: {db_id}){note}")
             elif "[entity-type]" in db_id_str:
-                note = " [entity-type: use find_fields(mode='browse' or 'deep')]"
+                note = (
+                    " [entity-type: use find_fields(mode='browse' or 'deep')]"
+                    if not is_apm_events else event_profile_note
+                )
                 if desc:
                     lines.append(f"  - {db_name}: {desc}{note}")
                 else:
                     lines.append(f"  - {db_name}{note}")
             elif desc:
-                lines.append(f"  - {db_name}: {desc} [searchable: use find_fields(mode='search')]")
+                tag = event_profile_note if is_apm_events else " [searchable: use find_fields(mode='search')]"
+                lines.append(f"  - {db_name}: {desc}{tag}")
             else:
-                lines.append(f"  - {db_name} [searchable: use find_fields(mode='search')]")
+                tag = event_profile_note if is_apm_events else " [searchable: use find_fields(mode='search')]"
+                lines.append(f"  - {db_name}{tag}")
 
     # Format subgroups
     groups = group.get("groups", [])
@@ -1870,6 +1886,551 @@ async def get_field_info(
         )
     except EMSAPIError as e:
         return f"Error getting field info: {e.message}"
+
+
+# ---------------------------------------------------------------------------
+# APM event-profile discovery
+# ---------------------------------------------------------------------------
+# Specific event names (e.g. "Hard Landing (Acceleration Method) (FDAP)") live
+# as DISCRETE VALUES inside each APM profile's Event Type field, not as field
+# names. A normal find_fields call therefore cannot surface them. The two
+# tools below give the agent a bounded, two-step workflow: list profiles
+# (cheap catalog), then search inside the chosen profiles' Event Type enums.
+
+_APM_GROUP_NAME: str = "apm events"
+_APM_GROUP_BFS_DEPTH: int = 5
+_PROFILE_CODE_RE = re.compile(r"\bP\d+\b", re.IGNORECASE)
+
+
+def _normalize_profile_code(code: str | None) -> str | None:
+    """Normalise a profile code to canonical "P<digits>" form (uppercase).
+
+    Returns ``None`` if the input does not contain a recognisable code.
+    """
+    if not code:
+        return None
+    match = _PROFILE_CODE_RE.search(code)
+    if not match:
+        return None
+    return match.group(0).upper()
+
+
+def _extract_profile_code(db: dict[str, Any]) -> str | None:
+    """Pull a "P<digits>" profile code out of a database descriptor.
+
+    Tries the database name first (e.g. ``"P40: Hard Landing Events"``),
+    then ``pluralName`` / ``singularName``, then ``description``. Returns
+    ``None`` if no leading-style profile code is found anywhere.
+    """
+    for key in ("name", "pluralName", "singularName", "description"):
+        code = _normalize_profile_code(db.get(key))
+        if code is not None:
+            return code
+    return None
+
+
+async def _find_apm_events_group(
+    ems_system_id: int,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Locate the APM Events group via a bounded BFS from root.
+
+    Returns ``(group_payload, root_group_names)``. ``group_payload`` is the
+    full ``database-groups`` response for the APM Events group (so callers
+    have its ``databases`` + ``groups`` lists), or ``None`` if not found.
+    ``root_group_names`` is the names of the groups that were at the root,
+    so the caller can produce a helpful error message when the folder is
+    missing.
+    """
+    client = get_client()
+
+    cache_key = make_cache_key("apm_events_group_payload", ems_system_id)
+    cached = await database_cache.get(cache_key)
+    if cached is not None:
+        return cached, []  # cached payload; root group names not needed on hit
+
+    root = await client.get(f"/api/v2/ems-systems/{ems_system_id}/database-groups")
+    root_group_names = [g.get("name", "?") for g in root.get("groups", [])]
+
+    queue: list[tuple[dict[str, Any], int]] = [(root, 0)]
+    visited_ids: set[str] = set()
+    while queue:
+        current, depth = queue.pop(0)
+        current_name = (current.get("name") or "").strip().lower()
+        if current_name == _APM_GROUP_NAME and current is not root:
+            await database_cache.set(cache_key, current)
+            return current, root_group_names
+
+        if depth >= _APM_GROUP_BFS_DEPTH:
+            continue
+
+        for child in current.get("groups", []):
+            child_id = child.get("id")
+            if not child_id or child_id in visited_ids:
+                continue
+            visited_ids.add(child_id)
+            # Short-circuit: if the child group is named "APM Events" we
+            # still need to fetch its full payload to see its databases,
+            # because the parent listing only carries id+name for children.
+            try:
+                payload = await client.get(
+                    f"/api/v2/ems-systems/{ems_system_id}"
+                    f"/database-groups?groupId={child_id}"
+                )
+            except (EMSAPIError, EMSNotFoundError):
+                continue
+            queue.append((payload, depth + 1))
+
+    return None, root_group_names
+
+
+async def _collect_profile_databases(
+    apm_group: dict[str, Any],
+    ems_system_id: int,
+) -> list[dict[str, Any]]:
+    """Flatten every database under the APM Events group, recursively.
+
+    Some EMS deployments nest profiles one more level deep inside the APM
+    Events group (e.g. by airframe or operator). A small BFS covers both
+    flat and nested layouts.
+    """
+    client = get_client()
+    collected: list[dict[str, Any]] = []
+    queue: list[dict[str, Any]] = [apm_group]
+    visited_ids: set[str] = set()
+    seen_db_ids: set[str] = set()
+
+    while queue:
+        current = queue.pop(0)
+        for db in current.get("databases", []):
+            db_id = db.get("id")
+            if not db_id or db_id in seen_db_ids:
+                continue
+            seen_db_ids.add(db_id)
+            collected.append(db)
+
+        for child in current.get("groups", []):
+            child_id = child.get("id")
+            if not child_id or child_id in visited_ids:
+                continue
+            visited_ids.add(child_id)
+            try:
+                payload = await client.get(
+                    f"/api/v2/ems-systems/{ems_system_id}"
+                    f"/database-groups?groupId={child_id}"
+                )
+            except (EMSAPIError, EMSNotFoundError):
+                continue
+            queue.append(payload)
+
+    return collected
+
+
+async def _get_event_profile_catalog(
+    ems_system_id: int,
+) -> tuple[list[dict[str, Any]] | None, list[str]]:
+    """Return the event-profile catalog and the root-group names.
+
+    Catalog entries are dicts: ``{"code", "database_id", "database_name",
+    "description"}``. Returns ``(None, root_group_names)`` when the APM
+    Events folder cannot be located, so callers can produce a useful
+    error.
+    """
+    cache_key = make_cache_key("event_profile_catalog", ems_system_id)
+    cached = await database_cache.get(cache_key)
+    if cached is not None:
+        return cached, []
+
+    apm_group, root_group_names = await _find_apm_events_group(ems_system_id)
+    if apm_group is None:
+        return None, root_group_names
+
+    dbs = await _collect_profile_databases(apm_group, ems_system_id)
+
+    catalog: list[dict[str, Any]] = []
+    for db in dbs:
+        db_id = db.get("id", "")
+        db_name = (
+            db.get("name")
+            or db.get("pluralName")
+            or db.get("singularName")
+            or "Unknown"
+        )
+        description = db.get("description", "") or ""
+        code = _extract_profile_code(db)
+        catalog.append({
+            "code": code,
+            "database_id": db_id,
+            "database_name": db_name,
+            "description": description,
+        })
+
+    # Stable order: profiles with a code first, sorted numerically by the
+    # digits; profiles without a code appended alphabetically by name. This
+    # keeps the catalog predictable across calls and easy for the agent to
+    # scan.
+    def sort_key(entry: dict[str, Any]) -> tuple[int, int, str]:
+        code = entry.get("code")
+        if code:
+            digits = re.findall(r"\d+", code)
+            return (0, int(digits[0]) if digits else 0, entry["database_name"].lower())
+        return (1, 0, entry["database_name"].lower())
+
+    catalog.sort(key=sort_key)
+
+    await database_cache.set(cache_key, catalog)
+    return catalog, []
+
+
+def _format_event_profile_catalog(
+    catalog: list[dict[str, Any]],
+) -> str:
+    """Format the event-profile catalog for display."""
+    if not catalog:
+        return (
+            "No event profile databases found under the APM Events folder. "
+            "The folder exists but is empty in this EMS deployment."
+        )
+
+    lines = [f"Found {len(catalog)} APM event profile(s):"]
+    code_width = max((len(e["code"] or "?") for e in catalog), default=4)
+    for entry in catalog:
+        code = entry["code"] or "?"
+        name = entry["database_name"]
+        desc = entry["description"]
+        if desc and desc.strip() and desc.strip() != name:
+            lines.append(f"  {code:<{code_width}}  {name} - {desc}")
+        else:
+            lines.append(f"  {code:<{code_width}}  {name}")
+    lines.append(
+        "\nNext: find_event_types(ems_system_id, query, profiles=[...]) "
+        "with one or more codes from this list to search a profile's "
+        "Event Type enum for a specific event name."
+    )
+    return "\n".join(lines)
+
+
+async def _resolve_event_type_field_id(
+    ems_system_id: int,
+    profile_code: str,
+    database_id: str,
+) -> tuple[str | None, str]:
+    """Resolve the opaque field ID for a profile's Event Type field.
+
+    Tries (in order) the literal name ``"Event Type"`` and the prefixed
+    name ``"{code}: Event Type"``. Resolution goes through
+    ``_resolve_field_id`` so result-store hits and entity-type BFS both
+    work.
+
+    Returns ``(field_id, name_used)`` on success, or ``(None,
+    error_message)`` on failure.
+    """
+    cache_key = make_cache_key(
+        "event_type_field", ems_system_id, database_id, profile_code,
+    )
+    cached = await field_cache.get(cache_key)
+    if cached is not None:
+        cached_id, cached_name = cached
+        return cached_id, cached_name
+
+    candidate_names = [
+        f"{profile_code}: Event Type",
+        "Event Type",
+    ]
+    errors: list[str] = []
+    for candidate in candidate_names:
+        try:
+            field_id = await _resolve_field_id(candidate, ems_system_id, database_id)
+        except (ValueError, EMSAPIError) as e:
+            errors.append(f"'{candidate}': {e}")
+            continue
+        await field_cache.set(cache_key, [field_id, candidate])
+        return field_id, candidate
+
+    return None, (
+        f"Could not locate an 'Event Type' field in profile {profile_code} "
+        f"(database {database_id}). Tried: {', '.join(candidate_names)}. "
+        f"Errors: {' | '.join(errors)}"
+    )
+
+
+async def _fetch_event_type_discrete_values(
+    ems_system_id: int,
+    database_id: str,
+    field_id: str,
+) -> list[dict[str, Any]]:
+    """Fetch the discrete values for a profile's Event Type field.
+
+    Reuses the same API path and cache key as ``get_field_info`` so cached
+    results are shared.
+    """
+    client = get_client()
+    cache_key = make_cache_key("field_info", ems_system_id, database_id, field_id)
+    cached = await field_cache.get(cache_key)
+    if cached is None:
+        encoded_field_id = urllib.parse.quote(field_id, safe="")
+        path = (
+            f"/api/v2/ems-systems/{ems_system_id}/databases/{database_id}"
+            f"/fields/{encoded_field_id}"
+        )
+        cached = await client.get(path)
+        await field_cache.set(cache_key, cached)
+
+    discrete = cached.get("discreteValues") or []
+    if isinstance(discrete, dict):
+        discrete = [{"value": k, "label": v} for k, v in discrete.items()]
+    return discrete
+
+
+def _match_event_label(
+    label: str,
+    queries: list[str],
+) -> bool:
+    """True iff every query in ``queries`` matches the label by AND-of-tokens.
+
+    Mirrors the semantics of ``_field_matches_query`` (tokenised,
+    case-insensitive, stop-words dropped). Multi-term queries behave as a
+    conjunction across terms: every query string must individually match,
+    and within each query every meaningful token must appear.
+    """
+    if not queries:
+        return False
+    for q in queries:
+        if not _field_matches_query(label, "", q):
+            return False
+    return True
+
+
+@mcp.tool
+async def list_event_profiles(ems_system_id: int) -> str:
+    """List every APM event-profile database (P14, P40, P600, P796, ...).
+
+    Use this FIRST when a user asks about a specific named event ("hard
+    landing", "tail strike", "GPWS warning", "unstable approach",
+    "exceedance"). Event names are discrete VALUES inside each profile's
+    Event Type field, not field names -- find_fields will not surface
+    them. After picking one or more profiles from this catalog based on
+    their descriptions, call find_event_types with the chosen codes.
+
+    Args:
+        ems_system_id: EMS system ID (from list_ems_systems).
+
+    Returns:
+        One line per profile with code, name, and description, plus a
+        pointer to find_event_types.
+    """
+    try:
+        catalog, root_group_names = await _get_event_profile_catalog(ems_system_id)
+    except EMSNotFoundError:
+        return (
+            f"Error: EMS system {ems_system_id} not found. "
+            "Use list_ems_systems to find valid system IDs."
+        )
+    except EMSAPIError as e:
+        return f"Error fetching event profiles: {e.message}"
+
+    if catalog is None:
+        if root_group_names:
+            hint = (
+                f"Root groups seen: {', '.join(root_group_names)}. "
+                "If APM Events is nested elsewhere, use list_databases to "
+                "navigate manually."
+            )
+        else:
+            hint = "Root has no groups at all -- check the EMS system ID."
+        return (
+            "Error: could not locate an 'APM Events' folder under the "
+            f"database-group hierarchy for ems_system_id={ems_system_id}. {hint}"
+        )
+
+    return _format_event_profile_catalog(catalog)
+
+
+@mcp.tool
+async def find_event_types(
+    ems_system_id: int,
+    query: str | list[str],
+    profiles: list[str],
+    max_results_per_profile: int = 20,
+) -> str:
+    """Search inside chosen APM profiles' Event Type enums for a named event.
+
+    Required two-step workflow:
+      1. list_event_profiles(ems_system_id) -- see the catalog of profiles
+         with their descriptions, so you can pick deliberately.
+      2. find_event_types(ems_system_id, query, profiles=[...]) -- this
+         tool. The profiles list is REQUIRED and bounds the scan cost.
+
+    Each named profile's Event Type field is read once (cached), then its
+    discrete value labels are matched against every query term with
+    AND-of-tokens semantics. Results are grouped by profile and registered
+    as numbered [N] references for use in downstream tools.
+
+    Args:
+        ems_system_id: EMS system ID.
+        query: A search term, or a list of terms. Each term is matched
+            with AND-of-tokens against the event label; multi-term lists
+            behave as a conjunction across terms (all must hit). Stop
+            words (a, an, the, of, ...) are dropped.
+        profiles: REQUIRED non-empty list of profile codes (e.g. ["P40",
+            "P796"]). Codes are case-insensitive. Each must appear in the
+            catalog returned by list_event_profiles -- unknown codes
+            return an error.
+        max_results_per_profile: Cap on matches reported per profile
+            (default: 20).
+
+    Returns:
+        One line per matching event grouped by profile, plus a
+        ready-to-use Event Type filter recipe.
+    """
+    if not profiles:
+        return (
+            "Error: profiles list is empty. find_event_types requires you to "
+            "name one or more profiles to scan. Call list_event_profiles("
+            f"ems_system_id={ems_system_id}) first, pick codes whose "
+            "descriptions plausibly match the event, then pass them as "
+            "profiles=[\"P40\", ...]."
+        )
+
+    # Normalise queries to a list of non-empty strings.
+    if isinstance(query, str):
+        query_list = [query.strip()] if query.strip() else []
+    else:
+        query_list = [q.strip() for q in query if isinstance(q, str) and q.strip()]
+    if not query_list:
+        return "Error: query is empty. Pass at least one non-empty search term."
+
+    try:
+        catalog, _ = await _get_event_profile_catalog(ems_system_id)
+    except EMSNotFoundError:
+        return (
+            f"Error: EMS system {ems_system_id} not found. "
+            "Use list_ems_systems to find valid system IDs."
+        )
+    except EMSAPIError as e:
+        return f"Error fetching event profiles: {e.message}"
+
+    if not catalog:
+        return (
+            "Error: no APM event profiles available in this EMS deployment. "
+            "Call list_event_profiles to confirm the catalog is empty."
+        )
+
+    by_code: dict[str, dict[str, Any]] = {
+        entry["code"]: entry for entry in catalog if entry.get("code")
+    }
+    valid_codes = sorted(by_code.keys(), key=lambda c: (int(re.findall(r"\d+", c)[0]) if re.findall(r"\d+", c) else 0, c))
+
+    requested: list[tuple[str, dict[str, Any]]] = []
+    unknown: list[str] = []
+    seen_codes: set[str] = set()
+    for raw in profiles:
+        code = _normalize_profile_code(raw if isinstance(raw, str) else None)
+        if not code or code not in by_code:
+            unknown.append(str(raw))
+            continue
+        if code in seen_codes:
+            continue
+        seen_codes.add(code)
+        requested.append((code, by_code[code]))
+
+    if unknown:
+        return (
+            f"Error: unknown profile code(s): {', '.join(unknown)}. "
+            f"Valid codes from the catalog: {', '.join(valid_codes)}. "
+            f"Call list_event_profiles(ems_system_id={ems_system_id}) "
+            "to refresh."
+        )
+
+    # Per-profile scan. Errors on a single profile are reported inline so
+    # one bad profile does not blank out matches from the others.
+    output_blocks: list[str] = []
+    total_matches = 0
+    profile_errors: list[str] = []
+
+    for code, entry in requested:
+        db_id = entry["database_id"]
+        field_id, name_used_or_error = await _resolve_event_type_field_id(
+            ems_system_id, code, db_id,
+        )
+        if field_id is None:
+            profile_errors.append(f"[{code}] {name_used_or_error}")
+            continue
+
+        try:
+            discrete = await _fetch_event_type_discrete_values(
+                ems_system_id, db_id, field_id,
+            )
+        except (EMSAPIError, EMSNotFoundError) as e:
+            profile_errors.append(f"[{code}] failed to read Event Type values: {e}")
+            continue
+
+        matches: list[tuple[Any, str]] = []
+        for dv in discrete:
+            if not isinstance(dv, dict):
+                continue
+            label = str(dv.get("label", "")).strip()
+            value = dv.get("value")
+            if not label or value is None:
+                continue
+            if _match_event_label(label, query_list):
+                matches.append((value, label))
+            if len(matches) >= max_results_per_profile:
+                break
+
+        if not matches:
+            continue
+
+        block_lines = [f"[{code}] {entry['database_name']}"]
+        label_width = max(len(label) for _, label in matches)
+        for value, label in matches:
+            ref = _store_result(
+                f"Event Type = {label}",
+                str(value),
+                result_type="event-value",
+                ems_system_id=ems_system_id,
+                database_id=db_id,
+            )
+            block_lines.append(
+                f"  [{ref}] {label:<{label_width}}  code={value}"
+            )
+        output_blocks.append("\n".join(block_lines))
+        total_matches += len(matches)
+
+    scanned = [code for code, _ in requested]
+    query_repr = query_list[0] if len(query_list) == 1 else " AND ".join(
+        f"'{q}'" for q in query_list
+    )
+
+    if total_matches == 0:
+        lines = [
+            f"No matches for {query_repr!r} in profiles "
+            f"[{', '.join(scanned)}]. The query is matched against the "
+            "discrete label of each Event Type value; do NOT silently fall "
+            "back to find_fields with the same term -- broaden the profile "
+            "list or refine the query."
+        ]
+        if profile_errors:
+            lines.append("")
+            lines.append("Profile errors:")
+            for err in profile_errors:
+                lines.append(f"  {err}")
+        return "\n".join(lines)
+
+    header = (
+        f"Found {total_matches} event match(es) for {query_repr!r} across "
+        f"{len(scanned)} profile(s):"
+    )
+    lines = [header, ""] + output_blocks + [""]
+    lines.append(
+        "Next: filter Event Type == <label> (or use the [N] reference) "
+        "in query_database against the matching profile's Events database."
+    )
+    if profile_errors:
+        lines.append("")
+        lines.append("Profile errors (other profiles still returned matches):")
+        for err in profile_errors:
+            lines.append(f"  {err}")
+    return "\n".join(lines)
 
 
 @mcp.tool
