@@ -315,13 +315,26 @@ class TestFindEventTypes:
         return client
 
     @pytest.mark.asyncio
-    async def test_empty_profiles_returns_pointer_to_catalog(self) -> None:
-        result = await _find_event_types(
-            ems_system_id=1, query="hard landing", profiles=[],
-        )
+    async def test_auto_shortlist_no_match_errors_clearly(self) -> None:
+        """Profiles omitted + no description matches the query => clean
+        error pointing at list_event_profiles + name_filter, not a blind
+        scan and not a silent fallback."""
+        # Default _setup descriptions are "{code} description" which do
+        # not contain "hard" or "landing" -> auto-shortlist hits nothing.
+        client = await self._setup({
+            "P40": [{"value": 1, "label": "Hard Landing"}],
+            "P796": [{"value": 1, "label": "Tail Strike"}],
+        })
+        with patch("ems_mcp.tools.discovery.get_client", return_value=client):
+            result = await _find_event_types(
+                ems_system_id=1, query="hard landing",
+            )
         assert "Error" in result
-        assert "profiles" in result.lower()
+        assert "no APM profile name/description matched" in result.lower() or (
+            "no apm profile" in result.lower() and "matched" in result.lower()
+        )
         assert "list_event_profiles" in result
+        assert "name_filter" in result
 
     @pytest.mark.asyncio
     async def test_unknown_profile_code_returns_valid_list(self) -> None:
@@ -461,6 +474,177 @@ class TestFindEventTypes:
             )
         assert "Hard Landing" in result
         assert "Error" not in result.splitlines()[0]
+
+
+class TestListEventProfilesNameFilter:
+    """name_filter narrowing on list_event_profiles."""
+
+    @pytest.fixture(autouse=True)
+    async def _clear(self) -> None:
+        await database_cache.clear()
+        await field_cache.clear()
+        _reset_result_store()
+
+    @pytest.mark.asyncio
+    async def test_name_filter_narrows_to_matching_profiles(self) -> None:
+        profiles = [
+            _profile_db("P14", description="Ground Operations Profile"),
+            _profile_db("P40", description="FDAP Landing Profile"),
+            _profile_db("P600", description="Engineering Limits Profile"),
+            _profile_db("P796", description="Generic Safety Events"),
+            _profile_db("P519", description="Unstable Approach Events"),
+        ]
+        root, routes = _make_root_response(profiles=profiles)
+        client = _make_mock_client(root, routes)
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=client):
+            result = await _list_event_profiles(
+                ems_system_id=1, name_filter="landing",
+            )
+
+        # Only P40 should be present; others must be filtered out.
+        assert "P40" in result
+        assert "FDAP Landing Profile" in result
+        for absent in ("P14", "P600", "P796", "P519"):
+            assert absent not in result, f"{absent} should have been filtered out"
+        # Header should signal that a filter was applied.
+        assert "landing" in result.lower()
+        assert "matching" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_name_filter_no_match_returns_helpful_message(self) -> None:
+        profiles = [
+            _profile_db("P14", description="Ground Operations Profile"),
+            _profile_db("P40", description="FDAP Landing Profile"),
+        ]
+        root, routes = _make_root_response(profiles=profiles)
+        client = _make_mock_client(root, routes)
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=client):
+            result = await _list_event_profiles(
+                ems_system_id=1, name_filter="bird-strike",
+            )
+
+        assert "No event profile databases matched" in result
+        assert "bird-strike" in result.lower()
+        # Mentions how many profiles exist in total so the caller can
+        # decide whether to re-call without a filter.
+        assert "2" in result
+
+    @pytest.mark.asyncio
+    async def test_max_results_truncates_large_match_list(self) -> None:
+        profiles = [
+            _profile_db(f"P{i}", description="Landing Profile")
+            for i in range(1, 21)
+        ]
+        root, routes = _make_root_response(profiles=profiles)
+        client = _make_mock_client(root, routes)
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=client):
+            result = await _list_event_profiles(
+                ems_system_id=1, name_filter="landing", max_results=5,
+            )
+
+        assert "Showing first 5" in result
+        assert "20" in result  # total match count surfaced
+        # Hint at how to narrow further.
+        assert "name_filter" in result
+
+
+class TestFindEventTypesAutoShortlist:
+    """Auto-shortlist behaviour when profiles= is omitted."""
+
+    @pytest.fixture(autouse=True)
+    async def _clear(self) -> None:
+        await database_cache.clear()
+        await field_cache.clear()
+        _reset_result_store()
+
+    @pytest.mark.asyncio
+    async def test_auto_shortlist_picks_profile_by_description_match(self) -> None:
+        """Profiles omitted; query 'hard landing' matches the description
+        'FDAP Landing Profile' via the 'landing' token, so P40 is auto-
+        shortlisted and its Event Type values are scanned."""
+        p40 = _profile_db("P40", description="FDAP Landing Profile")
+        p14 = _profile_db("P14", description="Ground Operations")
+        root, routes = _make_root_response(profiles=[p40, p14])
+        client = _make_mock_client(root, routes)
+
+        # Seed only P40's Event Type values; P14 shouldn't be scanned.
+        await _seed_event_type_field(
+            ems_system_id=1,
+            database_id=p40["id"],
+            profile_code="P40",
+            field_id="event-type-field-p40",
+            discrete_values=[
+                {"value": 47, "label": "Hard Landing (Acceleration Method) (FDAP)"},
+            ],
+        )
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=client):
+            result = await _find_event_types(
+                ems_system_id=1, query="hard landing",
+            )
+
+        assert "Hard Landing (Acceleration Method) (FDAP)" in result
+        # Header should make auto-shortlisting explicit.
+        assert "auto-selected" in result.lower()
+        assert "P40" in result
+        # Override hint must be present so the LLM knows it can widen.
+        assert "profiles=" in result
+
+    @pytest.mark.asyncio
+    async def test_auto_shortlist_truncates_with_top_candidates(self) -> None:
+        """Too many profiles match the query => error listing the top
+        candidates instead of scanning all of them."""
+        many_profiles = [
+            _profile_db(f"P{i}", description="Landing Profile")
+            for i in range(1, 16)
+        ]
+        root, routes = _make_root_response(profiles=many_profiles)
+        client = _make_mock_client(root, routes)
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=client):
+            result = await _find_event_types(
+                ems_system_id=1,
+                query="hard landing",
+                max_auto_profiles=5,
+            )
+
+        assert "Error" in result
+        assert "too many profiles" in result.lower()
+        # The top candidates should be listed inline.
+        assert "P1" in result
+        # Caller is told both routes out of the error.
+        assert "profiles=" in result
+        assert "max_auto_profiles" in result or "narrow" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_explicit_profiles_overrides_auto_shortlist(self) -> None:
+        """Even when descriptions don't match the query, an explicit
+        profiles= list still works and the header does NOT mark the
+        scan as auto-selected."""
+        p40 = _profile_db("P40", description="Generic profile description")
+        root, routes = _make_root_response(profiles=[p40])
+        client = _make_mock_client(root, routes)
+
+        await _seed_event_type_field(
+            ems_system_id=1,
+            database_id=p40["id"],
+            profile_code="P40",
+            field_id="event-type-field-p40",
+            discrete_values=[
+                {"value": 47, "label": "Hard Landing"},
+            ],
+        )
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=client):
+            result = await _find_event_types(
+                ems_system_id=1, query="hard landing", profiles=["P40"],
+            )
+
+        assert "Hard Landing" in result
+        assert "auto-selected" not in result.lower()
 
 
 class TestFindEventTypesColdPath:

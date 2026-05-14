@@ -2081,17 +2081,113 @@ async def _get_event_profile_catalog(
     return catalog, []
 
 
+def _catalog_entry_haystack(entry: dict[str, Any]) -> str:
+    """Concatenated lowercase haystack for matching against a catalog entry."""
+    return " ".join([
+        entry.get("code") or "",
+        entry.get("database_name") or "",
+        entry.get("description") or "",
+    ]).lower()
+
+
+def _filter_catalog_by_name(
+    catalog: list[dict[str, Any]],
+    name_filter: str,
+) -> list[dict[str, Any]]:
+    """Filter catalog entries whose code/name/description match ``name_filter``.
+
+    AND-of-tokens, case-insensitive, mirroring ``_field_matches_query``.
+    Falls back to whole-string substring match when the filter consists
+    entirely of stop-words / punctuation.
+    """
+    return [
+        entry for entry in catalog
+        if _field_matches_query(_catalog_entry_haystack(entry), "", name_filter)
+    ]
+
+
+def _auto_shortlist_profiles(
+    catalog: list[dict[str, Any]],
+    query_terms: list[str],
+    max_count: int,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Pick profiles whose name/description contains ANY query token.
+
+    More permissive than ``_filter_catalog_by_name`` -- any-token (OR)
+    instead of AND -- because event-name tokens often only partially
+    overlap with profile descriptions (e.g. "tail strike" against a
+    profile named "Airframe Strike" still matches via "strike").
+
+    Returns ``(shortlist, truncated)``. ``truncated`` is True if more
+    profiles matched than ``max_count``; the caller is expected to
+    surface that rather than silently slice.
+    """
+    tokens: list[str] = []
+    for q in query_terms:
+        tokens.extend(_tokenize_query(q))
+    seen: set[str] = set()
+    deduped_tokens: list[str] = []
+    for t in tokens:
+        if t not in seen:
+            seen.add(t)
+            deduped_tokens.append(t)
+    if not deduped_tokens:
+        return [], False
+
+    matches: list[dict[str, Any]] = []
+    for entry in catalog:
+        haystack = _catalog_entry_haystack(entry)
+        if any(t in haystack for t in deduped_tokens):
+            matches.append(entry)
+
+    truncated = len(matches) > max_count
+    return matches[:max_count], truncated
+
+
 def _format_event_profile_catalog(
     catalog: list[dict[str, Any]],
+    *,
+    total_unfiltered: int | None = None,
+    max_display: int | None = None,
+    name_filter: str | None = None,
 ) -> str:
-    """Format the event-profile catalog for display."""
+    """Format the event-profile catalog for display.
+
+    Args:
+        catalog: The (possibly filtered, possibly truncated) entries to render.
+        total_unfiltered: Total number of profiles in the catalog before
+            ``name_filter`` was applied. When set and different from
+            ``len(catalog)``, the header notes how many were filtered out.
+        max_display: Cap that has already been applied to ``catalog``. When
+            set and there were more matches than fit, a truncation note is
+            appended.
+        name_filter: The filter string in effect, surfaced in messages so
+            the caller can see what narrowed the result.
+    """
     if not catalog:
+        if name_filter:
+            return (
+                f"No event profile databases matched name_filter={name_filter!r}. "
+                f"{'There are ' + str(total_unfiltered) + ' profile(s) total -- ' if total_unfiltered else ''}"
+                "call list_event_profiles without name_filter to see the full catalog."
+            )
         return (
             "No event profile databases found under the APM Events folder. "
             "The folder exists but is empty in this EMS deployment."
         )
 
-    lines = [f"Found {len(catalog)} APM event profile(s):"]
+    if name_filter:
+        header = (
+            f"Found {len(catalog)} APM event profile(s) matching "
+            f"name_filter={name_filter!r}"
+        )
+        if total_unfiltered is not None and total_unfiltered > len(catalog):
+            header += f" (of {total_unfiltered} total)"
+        header += ":"
+    else:
+        header = f"Found {len(catalog)} APM event profile(s):"
+
+    lines = [header]
     code_width = max((len(e["code"] or "?") for e in catalog), default=4)
     for entry in catalog:
         code = entry["code"] or "?"
@@ -2101,10 +2197,22 @@ def _format_event_profile_catalog(
             lines.append(f"  {code:<{code_width}}  {name} - {desc}")
         else:
             lines.append(f"  {code:<{code_width}}  {name}")
+    if (
+        max_display is not None
+        and total_unfiltered is not None
+        and total_unfiltered > len(catalog)
+        and len(catalog) >= max_display
+    ):
+        # Filter (or unfiltered list) had more matches than fit; warn.
+        lines.append(
+            f"\n(Showing first {max_display} of {total_unfiltered} match(es). "
+            "Pass a narrower name_filter to refine, or raise max_results.)"
+        )
     lines.append(
         "\nNext: find_event_types(ems_system_id, query, profiles=[...]) "
-        "with one or more codes from this list to search a profile's "
-        "Event Type enum for a specific event name."
+        "with one or more codes from this list. If you don't yet know "
+        "which profile, omit profiles= and find_event_types will "
+        "auto-shortlist based on the query."
     )
     return "\n".join(lines)
 
@@ -2201,8 +2309,12 @@ def _match_event_label(
 
 
 @mcp.tool
-async def list_event_profiles(ems_system_id: int) -> str:
-    """List every APM event-profile database (P14, P40, P600, P796, ...).
+async def list_event_profiles(
+    ems_system_id: int,
+    name_filter: str | None = None,
+    max_results: int = 50,
+) -> str:
+    """List APM event-profile databases (P14, P40, P600, P796, ...).
 
     Use this FIRST when a user asks about a specific named event ("hard
     landing", "tail strike", "GPWS warning", "unstable approach",
@@ -2211,8 +2323,18 @@ async def list_event_profiles(ems_system_id: int) -> str:
     them. After picking one or more profiles from this catalog based on
     their descriptions, call find_event_types with the chosen codes.
 
+    Some EMS deployments have thousands of profiles. Pass ``name_filter``
+    to narrow the catalog server-side instead of asking for it all (e.g.
+    ``name_filter="landing"`` to see only landing-related profiles).
+
     Args:
         ems_system_id: EMS system ID (from list_ems_systems).
+        name_filter: Optional substring filter matched (AND-of-tokens,
+            case-insensitive) against each profile's code, database name,
+            and description. Omit to see the full catalog.
+        max_results: Maximum profiles to render (default: 50). If more
+            match the filter, a truncation note is appended pointing at
+            how to narrow further.
 
     Returns:
         One line per profile with code, name, and description, plus a
@@ -2242,28 +2364,60 @@ async def list_event_profiles(ems_system_id: int) -> str:
             f"database-group hierarchy for ems_system_id={ems_system_id}. {hint}"
         )
 
-    return _format_event_profile_catalog(catalog)
+    total_unfiltered = len(catalog)
+    filter_clean = (name_filter or "").strip() or None
+    displayed = catalog
+    if filter_clean:
+        displayed = _filter_catalog_by_name(catalog, filter_clean)
+    matched_total = len(displayed)
+    if max_results > 0 and matched_total > max_results:
+        displayed = displayed[:max_results]
+
+    # When the filter zero-matched, surface the unfiltered catalog size so
+    # the agent knows the directory exists and just nothing matched. When
+    # the filter did match, surface the match count for the "showing first
+    # N of M" truncation note.
+    if filter_clean:
+        report_total = matched_total if matched_total > 0 else total_unfiltered
+    else:
+        report_total = total_unfiltered
+
+    return _format_event_profile_catalog(
+        displayed,
+        total_unfiltered=report_total,
+        max_display=max_results,
+        name_filter=filter_clean,
+    )
 
 
 @mcp.tool
 async def find_event_types(
     ems_system_id: int,
     query: str | list[str],
-    profiles: list[str],
+    profiles: list[str] | None = None,
     max_results_per_profile: int = 20,
+    max_auto_profiles: int = 10,
 ) -> str:
-    """Search inside chosen APM profiles' Event Type enums for a named event.
+    """Search inside APM profiles' Event Type enums for a named event.
 
-    Required two-step workflow:
-      1. list_event_profiles(ems_system_id) -- see the catalog of profiles
-         with their descriptions, so you can pick deliberately.
+    Two-step workflow:
+      1. list_event_profiles(ems_system_id[, name_filter=...]) -- see the
+         catalog of profiles with their descriptions, so you can pick
+         deliberately.
       2. find_event_types(ems_system_id, query, profiles=[...]) -- this
-         tool. The profiles list is REQUIRED and bounds the scan cost.
+         tool. Pass the codes from step 1 to bound the scan.
 
-    Each named profile's Event Type field is read once (cached), then its
-    discrete value labels are matched against every query term with
-    AND-of-tokens semantics. Results are grouped by profile and registered
-    as numbered [N] references for use in downstream tools.
+    If you don't yet know which profile to scan, you may OMIT
+    ``profiles``: the tool then auto-shortlists profiles whose name or
+    description contains any token from ``query`` (capped at
+    ``max_auto_profiles``). When the auto-shortlist is empty or too
+    broad, the tool errors with a clear next step instead of scanning
+    blindly.
+
+    Each scanned profile's Event Type field is read once (cached), then
+    its discrete value labels are matched against every query term with
+    AND-of-tokens semantics. Results are grouped by profile and
+    registered as numbered [N] references for use in downstream tools.
 
     Args:
         ems_system_id: EMS system ID.
@@ -2271,26 +2425,23 @@ async def find_event_types(
             with AND-of-tokens against the event label; multi-term lists
             behave as a conjunction across terms (all must hit). Stop
             words (a, an, the, of, ...) are dropped.
-        profiles: REQUIRED non-empty list of profile codes (e.g. ["P40",
-            "P796"]). Codes are case-insensitive. Each must appear in the
-            catalog returned by list_event_profiles -- unknown codes
-            return an error.
+        profiles: Optional list of profile codes (e.g. ["P40", "P796"]).
+            Codes are case-insensitive. Each must appear in the catalog.
+            Omit to let the tool auto-shortlist by query match -- useful
+            on EMS deployments with thousands of profiles where listing
+            the full catalog is impractical.
         max_results_per_profile: Cap on matches reported per profile
             (default: 20).
+        max_auto_profiles: Cap on auto-shortlist size when ``profiles``
+            is omitted (default: 10). If more profiles match the query,
+            the tool errors with the top candidates listed and asks for
+            an explicit ``profiles=[...]`` selection.
 
     Returns:
         One line per matching event grouped by profile, plus a
-        ready-to-use Event Type filter recipe.
+        ready-to-use Event Type filter recipe. When the auto-shortlist
+        was used, the header surfaces which profiles were picked.
     """
-    if not profiles:
-        return (
-            "Error: profiles list is empty. find_event_types requires you to "
-            "name one or more profiles to scan. Call list_event_profiles("
-            f"ems_system_id={ems_system_id}) first, pick codes whose "
-            "descriptions plausibly match the event, then pass them as "
-            "profiles=[\"P40\", ...]."
-        )
-
     # Normalise queries to a list of non-empty strings.
     if isinstance(query, str):
         query_list = [query.strip()] if query.strip() else []
@@ -2318,28 +2469,67 @@ async def find_event_types(
     by_code: dict[str, dict[str, Any]] = {
         entry["code"]: entry for entry in catalog if entry.get("code")
     }
-    valid_codes = sorted(by_code.keys(), key=lambda c: (int(re.findall(r"\d+", c)[0]) if re.findall(r"\d+", c) else 0, c))
+    valid_codes = sorted(
+        by_code.keys(),
+        key=lambda c: (
+            int(re.findall(r"\d+", c)[0]) if re.findall(r"\d+", c) else 0, c,
+        ),
+    )
 
-    requested: list[tuple[str, dict[str, Any]]] = []
-    unknown: list[str] = []
-    seen_codes: set[str] = set()
-    for raw in profiles:
-        code = _normalize_profile_code(raw if isinstance(raw, str) else None)
-        if not code or code not in by_code:
-            unknown.append(str(raw))
-            continue
-        if code in seen_codes:
-            continue
-        seen_codes.add(code)
-        requested.append((code, by_code[code]))
+    auto_selected: bool = False
+    if profiles:
+        requested: list[tuple[str, dict[str, Any]]] = []
+        unknown: list[str] = []
+        seen_codes: set[str] = set()
+        for raw in profiles:
+            code = _normalize_profile_code(raw if isinstance(raw, str) else None)
+            if not code or code not in by_code:
+                unknown.append(str(raw))
+                continue
+            if code in seen_codes:
+                continue
+            seen_codes.add(code)
+            requested.append((code, by_code[code]))
 
-    if unknown:
-        return (
-            f"Error: unknown profile code(s): {', '.join(unknown)}. "
-            f"Valid codes from the catalog: {', '.join(valid_codes)}. "
-            f"Call list_event_profiles(ems_system_id={ems_system_id}) "
-            "to refresh."
+        if unknown:
+            return (
+                f"Error: unknown profile code(s): {', '.join(unknown)}. "
+                f"Valid codes from the catalog: {', '.join(valid_codes)}. "
+                f"Call list_event_profiles(ems_system_id={ems_system_id}) "
+                "to refresh."
+            )
+    else:
+        # Auto-shortlist: pick profiles whose name/description mentions
+        # any query token. Bounded by max_auto_profiles to prevent the
+        # blind-everywhere scan that the required-profiles design was
+        # originally added to avoid.
+        shortlist, truncated = _auto_shortlist_profiles(
+            catalog, query_list, max_auto_profiles,
         )
+        if not shortlist:
+            return (
+                f"Error: no APM profile name/description matched any token "
+                f"in {query_list!r}. The auto-shortlist could not pick a "
+                "target. Either narrow the query, or call "
+                f"list_event_profiles(ems_system_id={ems_system_id}, "
+                "name_filter=\"...\") to browse and then re-call with an "
+                "explicit profiles=[...]."
+            )
+        if truncated:
+            preview = ", ".join(
+                (e.get("code") or e.get("database_name") or "?")
+                for e in shortlist
+            )
+            return (
+                f"Error: query {query_list!r} matched too many profiles "
+                f"(>{max_auto_profiles}). Top candidates: {preview}. "
+                "Either pass an explicit profiles=[...] list, raise "
+                "max_auto_profiles, or narrow the query."
+            )
+        requested = [
+            (entry["code"], entry) for entry in shortlist if entry.get("code")
+        ]
+        auto_selected = True
 
     # Per-profile scan. Errors on a single profile are reported inline so
     # one bad profile does not blank out matches from the others.
@@ -2402,12 +2592,17 @@ async def find_event_types(
     )
 
     if total_matches == 0:
+        auto_note = (
+            " These profiles were auto-selected from the query; pass "
+            "profiles=[...] explicitly with a wider net to widen the scan."
+            if auto_selected else ""
+        )
         lines = [
             f"No matches for {query_repr!r} in profiles "
-            f"[{', '.join(scanned)}]. The query is matched against the "
-            "discrete label of each Event Type value; do NOT silently fall "
-            "back to find_fields with the same term -- broaden the profile "
-            "list or refine the query."
+            f"[{', '.join(scanned)}].{auto_note} The query is matched "
+            "against the discrete label of each Event Type value; do NOT "
+            "silently fall back to find_fields with the same term -- "
+            "broaden the profile list or refine the query."
         ]
         if profile_errors:
             lines.append("")
@@ -2416,10 +2611,18 @@ async def find_event_types(
                 lines.append(f"  {err}")
         return "\n".join(lines)
 
-    header = (
-        f"Found {total_matches} event match(es) for {query_repr!r} across "
-        f"{len(scanned)} profile(s):"
-    )
+    scanned_display = ", ".join(scanned)
+    if auto_selected:
+        header = (
+            f"Found {total_matches} event match(es) for {query_repr!r} across "
+            f"{len(scanned)} auto-selected profile(s) [{scanned_display}]. "
+            "Pass profiles=[...] explicitly to override this selection."
+        )
+    else:
+        header = (
+            f"Found {total_matches} event match(es) for {query_repr!r} across "
+            f"{len(scanned)} profile(s):"
+        )
     lines = [header, ""] + output_blocks + [""]
     lines.append(
         "Next: filter Event Type == <label> (or use the [N] reference) "
