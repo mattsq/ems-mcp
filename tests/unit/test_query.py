@@ -967,6 +967,60 @@ class TestResolveAnalytics:
             result = await _resolve_analytics(["airspeed"], ems_system_id=1)
         assert result == [("Airspeed", "id-1")]
 
+    @pytest.mark.asyncio
+    async def test_numbered_ref_resolves_from_store(self) -> None:
+        """A [N] reference (e.g. from find_physical_params) should resolve to
+        the stored analytic ID without hitting the analytics search API. This
+        is the only path for physical-parameter names, which are flight-scoped
+        and not present in the global analytics search."""
+        from ems_mcp.tools.discovery import _reset_result_store, _store_result
+
+        _reset_result_store()
+        ref = _store_result(
+            "APU Bleed Valve", "phys-id-1",
+            result_type="analytic", ems_system_id=1,
+        )
+
+        mock_client = MagicMock()
+        with patch("ems_mcp.tools.query.get_client", return_value=mock_client):
+            # Both bracketed [N] and bare digit forms should resolve.
+            result = await _resolve_analytics([f"[{ref}]", str(ref)], ems_system_id=1)
+
+        assert result == [
+            ("APU Bleed Valve", "phys-id-1"),
+            ("APU Bleed Valve", "phys-id-1"),
+        ]
+        mock_client.get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_numbered_ref_unknown_raises(self) -> None:
+        """An unknown [N] reference should raise a clear ValueError rather than
+        falling through to a name search."""
+        from ems_mcp.tools.discovery import _reset_result_store
+
+        _reset_result_store()
+        mock_client = MagicMock()
+        with patch("ems_mcp.tools.query.get_client", return_value=mock_client):
+            with pytest.raises(ValueError, match="not a known analytic"):
+                await _resolve_analytics(["[999]"], ems_system_id=1)
+        mock_client.get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_numbered_ref_wrong_type_raises(self) -> None:
+        """A [N] reference that points at a non-analytic (e.g. a field) should
+        not be silently used as an analytic ID."""
+        from ems_mcp.tools.discovery import _reset_result_store, _store_result
+
+        _reset_result_store()
+        ref = _store_result(
+            "Fuel Burned", "field-id-1",
+            result_type="field", ems_system_id=1, database_id="[ems-core]",
+        )
+        mock_client = MagicMock()
+        with patch("ems_mcp.tools.query.get_client", return_value=mock_client):
+            with pytest.raises(ValueError, match="not a known analytic"):
+                await _resolve_analytics([f"[{ref}]"], ems_system_id=1)
+
 
 class TestFormatAnalyticsResultsWithNames:
     """Tests for _format_analytics_results with analytic_names parameter."""
