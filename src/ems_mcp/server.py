@@ -79,6 +79,22 @@ collapses N round-trips into one and is dramatically more token-efficient \
 4. Discrete value mappings: pass include_field_info=True to find_fields \
 to get mappings inline, or call get_field_info separately on specific fields.
 
+EVENT QUESTIONS (hard landing, tail strike, GPWS, unstable approach, \
+exceedance, runway excursion, etc.):
+Event names are DISCRETE VALUES inside each APM profile's Event Type \
+field, not field names. find_fields will NOT find them. Workflow:
+  a. list_event_profiles(ems_system_id [, name_filter="..."]) -- returns \
+APM event profiles (P14, P40, P600, ...) with descriptions. Some EMS \
+deployments have thousands of profiles, so pass name_filter (e.g. \
+name_filter="landing" or "strike") to narrow the catalog server-side \
+when you have a keyword.
+  b. find_event_types(ems_system_id, query, profiles=[...]) -- pass \
+profile codes from (a) to bound the scan. If you don't yet know which \
+profile, OMIT profiles= and the tool will auto-shortlist by query match \
+(capped, with a clear error if too many candidates). Returns \
+[N]-referenced event values you can use as Event Type filters in \
+query_database.
+
 FIELD REFERENCES:
 - find_fields returns numbered [N] references. Use these directly in \
 query_database, get_field_info, etc. -- no need to retrieve raw IDs.
