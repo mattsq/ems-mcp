@@ -17,6 +17,7 @@ from ems_mcp.api.client import EMSAPIError, EMSNotFoundError
 from ems_mcp.cache import field_cache, make_cache_key
 from ems_mcp.server import get_client, mcp
 from ems_mcp.tools.discovery import (
+    _get_stored_result,
     _lookup_stored_field,
     _resolve_database_id,
     _resolve_field_id,
@@ -95,6 +96,33 @@ async def _resolve_analytics(
 
     for item in names_or_ids:
         item = item.strip()
+
+        # [N] reference (or bare digits) from search_analytics /
+        # find_physical_params. Physical-parameter names cannot be resolved via
+        # the global analytics search (they are flight-scoped), so the [N] ref
+        # is the only way to carry them into a query -- resolve it from the
+        # store before anything else.
+        ref_num: int | None = None
+        if item.isdigit():
+            ref_num = int(item)
+        elif (
+            len(item) >= 3
+            and item.startswith("[")
+            and item.endswith("]")
+            and item[1:-1].isdigit()
+        ):
+            ref_num = int(item[1:-1])
+        if ref_num is not None:
+            entry = _get_stored_result(ref_num)
+            if entry is not None and entry.get("type") == "analytic":
+                results.append((entry.get("name", item), str(entry["id"])))
+                continue
+            raise ValueError(
+                f"Reference [{ref_num}] is not a known analytic. Use "
+                "search_analytics or find_physical_params to get a valid "
+                "reference."
+            )
+
         if _is_analytic_id(item):
             results.append((item, item))
             continue
