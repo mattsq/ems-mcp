@@ -34,13 +34,28 @@ This creates an `ems-mcp` executable inside the virtual environment:
 
 ## Configuration
 
-All MCP clients need three values to connect to your EMS server:
+### Credentials (Windows Credential Manager)
+
+Your EMS username and password are stored in Windows Credential Manager
+(or the OS keychain on macOS/Linux) rather than in MCP config files. Store them once:
+
+```bash
+.venv\Scripts\ems-mcp.exe credentials set      # prompts for username and password
+.venv\Scripts\ems-mcp.exe credentials show     # shows the stored username
+.venv\Scripts\ems-mcp.exe credentials delete   # removes the stored credential
+```
+
+This creates a Generic Credential named `ems-mcp`, visible under
+*Control Panel > Credential Manager > Windows Credentials*. To update your
+password, run `credentials set` again.
+
+### Environment variables
 
 | Variable | Description |
 |----------|-------------|
-| `EMS_BASE_URL` | EMS server URL (e.g. `https://your-ems-server.com`) -- do **not** include `/api` |
-| `EMS_USERNAME` | Your EMS username |
-| `EMS_PASSWORD` | Your EMS password |
+| `EMS_BASE_URL` | **Required.** EMS server URL (e.g. `https://your-ems-server.com`) -- do **not** include `/api` |
+| `EMS_KEYRING_SERVICE` | Optional. Credential Manager entry name (default `ems-mcp`); use different names for multiple EMS servers |
+| `EMS_USERNAME` / `EMS_PASSWORD` | Optional overrides for the stored credential (e.g. for CI). If only `EMS_USERNAME` is set, the stored password for that username is used |
 
 ### Claude Code (CLI)
 
@@ -53,9 +68,7 @@ Create a `.mcp.json` file in the project root:
       "command": "C:\\absolute\\path\\to\\ems-mcp\\.venv\\Scripts\\ems-mcp.exe",
       "args": [],
       "env": {
-        "EMS_BASE_URL": "https://your-ems-server.com",
-        "EMS_USERNAME": "your-username",
-        "EMS_PASSWORD": "your-password"
+        "EMS_BASE_URL": "https://your-ems-server.com"
       }
     }
   }
@@ -79,9 +92,7 @@ Add the server to the `mcpServers` block:
       "command": "C:\\absolute\\path\\to\\ems-mcp\\.venv\\Scripts\\ems-mcp.exe",
       "args": [],
       "env": {
-        "EMS_BASE_URL": "https://your-ems-server.com",
-        "EMS_USERNAME": "your-username",
-        "EMS_PASSWORD": "your-password"
+        "EMS_BASE_URL": "https://your-ems-server.com"
       }
     }
   }
@@ -103,9 +114,7 @@ Create `.gemini/settings.json` in the project directory:
       "command": "C:\\absolute\\path\\to\\ems-mcp\\.venv\\Scripts\\ems-mcp.exe",
       "args": [],
       "env": {
-        "EMS_BASE_URL": "https://your-ems-server.com",
-        "EMS_USERNAME": "your-username",
-        "EMS_PASSWORD": "your-password"
+        "EMS_BASE_URL": "https://your-ems-server.com"
       }
     }
   }
@@ -158,7 +167,7 @@ pytest tests/
 
 ## Troubleshooting
 
-**401 Unauthorized** -- Check that `EMS_USERNAME` and `EMS_PASSWORD` are correct and that the account has API access.
+**401 Unauthorized** -- Check the stored credential with `ems-mcp credentials show` (re-run `credentials set` if your password changed), make sure stale `EMS_USERNAME`/`EMS_PASSWORD` variables are not overriding it, and confirm the account has API access.
 
 **Connection errors** -- Verify `EMS_BASE_URL` does **not** include a `/api` suffix. It should be just the server URL (e.g. `https://your-ems-server.com`).
 

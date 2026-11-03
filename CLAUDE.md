@@ -22,10 +22,9 @@ source .venv/bin/activate  # or .venv\Scripts\activate on Windows
 # Install dependencies
 uv pip install -e .
 
-# Set credentials
+# Store credentials in Windows Credential Manager (prompts)
+python -m ems_mcp credentials set
 export EMS_BASE_URL="https://your-ems-server.com"
-export EMS_USERNAME="your-username"
-export EMS_PASSWORD="your-password"
 
 # Run server (stdio transport)
 python -m ems_mcp
@@ -141,10 +140,12 @@ The server uses OAuth 2.0 password grant:
 5. Include token in Authorization: Bearer header for all requests
 ```
 
-Credentials come from environment variables only:
-- `EMS_USERNAME`: Username or email
-- `EMS_PASSWORD`: Password
-- `EMS_BASE_URL`: API server URL (e.g., https://ems.example.com)
+Credentials come from Windows Credential Manager (via `keyring`, see `src/ems_mcp/credentials.py`):
+- Store with `python -m ems_mcp credentials set` (also `show` / `delete`)
+- Stored as Generic Credential target `ems-mcp` (override with `EMS_KEYRING_SERVICE`)
+- `EMS_USERNAME` / `EMS_PASSWORD` env vars, if set, take precedence (useful for CI)
+- `EMS_BASE_URL`: API server URL (e.g., https://ems.example.com) -- still an env var
+- Tests use an in-memory keyring (autouse `fake_keyring` fixture in `tests/conftest.py`)
 
 ### Error Handling
 
@@ -292,7 +293,7 @@ User sees result
 ## Troubleshooting
 
 ### "401 Unauthorized" errors
-- Check `EMS_USERNAME` and `EMS_PASSWORD` are set correctly
+- Check the stored credential with `python -m ems_mcp credentials show`; stale `EMS_USERNAME`/`EMS_PASSWORD` env vars override it
 - Verify the user has API access in EMS admin console
 - Check if password has special characters that need escaping
 
