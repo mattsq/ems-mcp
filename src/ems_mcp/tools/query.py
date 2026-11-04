@@ -19,8 +19,11 @@ from ems_mcp.server import get_client, mcp
 from ems_mcp.tools.discovery import (
     _get_stored_result,
     _lookup_stored_field,
+    _parse_ref_number,
+    _rank_by_name,
     _resolve_database_id,
     _resolve_field_id,
+    _result_store,
 )
 
 logger = logging.getLogger(__name__)
@@ -102,21 +105,18 @@ async def _resolve_analytics(
         # the global analytics search (they are flight-scoped), so the [N] ref
         # is the only way to carry them into a query -- resolve it from the
         # store before anything else.
-        ref_num: int | None = None
-        if item.isdigit():
-            ref_num = int(item)
-        elif (
-            len(item) >= 3
-            and item.startswith("[")
-            and item.endswith("]")
-            and item[1:-1].isdigit()
-        ):
-            ref_num = int(item[1:-1])
+        ref_num = _parse_ref_number(item)
         if ref_num is not None:
             entry = _get_stored_result(ref_num)
             if entry is not None and entry.get("type") == "analytic":
                 results.append((entry.get("name", item), str(entry["id"])))
                 continue
+            if entry is not None:
+                raise ValueError(
+                    f"Reference [{ref_num}] ('{entry.get('name')}') is a "
+                    f"{entry.get('type')}, not an analytic. Use search_analytics "
+                    "or find_physical_params to get an analytic reference."
+                )
             raise ValueError(
                 f"Reference [{ref_num}] is not a known analytic. Use "
                 "search_analytics or find_physical_params to get a valid "
@@ -125,6 +125,19 @@ async def _resolve_analytics(
 
         if _is_analytic_id(item):
             results.append((item, item))
+            continue
+
+        # A name already returned by search_analytics / find_physical_params
+        # this session. Physical-parameter names are flight-scoped and absent
+        # from the global search, so this is the only way they resolve by name.
+        stored = [
+            e for e in _result_store.values()
+            if e.get("type") == "analytic"
+            and e.get("ems_system_id") == ems_system_id
+            and str(e.get("name", "")).lower() == item.lower()
+        ]
+        if len({str(e["id"]) for e in stored}) == 1:
+            results.append((stored[0]["name"], str(stored[0]["id"])))
             continue
 
         # Check cache first. The cache stores [name, id] as a list because the
@@ -144,11 +157,13 @@ async def _resolve_analytics(
 
         if not search_results:
             raise ValueError(
-                f"Analytic not found: '{item}'. "
-                "Use search_analytics to find valid analytic names."
+                f"Analytic not found: '{item}'. Use search_analytics to find valid "
+                "analytic names. Raw recorder parameters are not in the global "
+                "search -- use find_physical_params(flight_id=...) and pass its [N]."
             )
 
-        # Try exact name match (case-insensitive)
+        # Only an exact (case-insensitive) name match is used automatically;
+        # a lone fuzzy hit could be a different parameter entirely.
         exact_matches = [
             a for a in search_results
             if a.get("name", "").lower() == item.lower()
@@ -159,20 +174,13 @@ async def _resolve_analytics(
             results.append(pair)
             continue
 
-        # If only one result total, use it
-        if len(search_results) == 1:
-            pair = (search_results[0]["name"], search_results[0]["id"])
-            await field_cache.set(cache_key, list(pair))
-            results.append(pair)
-            continue
-
-        # Multiple matches with no exact match - ambiguous
-        match_names = [a.get("name", "?") for a in search_results[:5]]
+        ranked = _rank_by_name(search_results, item)
+        match_names = [a.get("name", "?") for a in ranked[:8]]
         raise ValueError(
-            f"Ambiguous analytic name: '{item}'. "
-            f"Multiple matches found: {', '.join(match_names)}"
-            f"{'...' if len(search_results) > 5 else ''}. "
-            "Use a more specific name or use search_analytics to find the exact name."
+            f"Analytic name '{item}' is not an exact match. Closest names: "
+            f"{'; '.join(match_names)}{' ...' if len(ranked) > 8 else ''}. "
+            "Pass one of these exactly, or an [N] from search_analytics. Raw "
+            "recorder parameters need find_physical_params(flight_id=...) instead."
         )
 
     return results
@@ -336,13 +344,22 @@ async def _resolve_discrete_filter_value(
                     return raw_code
             return raw_code
 
-    # Not found - build helpful error
-    sample_labels = [str(dv.get("label", "?")) for dv in entries[:10]]
-    suffix = f" (and {len(entries) - 10} more)" if len(entries) > 10 else ""
+    # Not found - build helpful error. Prefer labels containing the input
+    # (e.g. "a321" -> every A321 fleet) over the first N alphabetically.
+    field_name = meta.get("name") or field_id
+    labels = [str(dv.get("label", "?")) for dv in entries]
+    partial = [lab for lab in labels if value_lower in lab.lower()]
+    if partial:
+        shown = partial[:15]
+        more = f" (and {len(partial) - 15} more)" if len(partial) > 15 else ""
+        detail = f"Values containing '{value}': {'; '.join(shown)}{more}."
+    else:
+        more = f" (and {len(labels) - 10} more)" if len(labels) > 10 else ""
+        detail = f"Available values include: {'; '.join(labels[:10])}{more}."
     raise ValueError(
-        f"Discrete value '{value}' not found for field '{field_id}'. "
-        f"Available values include: {', '.join(sample_labels)}{suffix}. "
-        "Use get_field_info to see all discrete values."
+        f"Discrete value '{value}' is not an exact label of field '{field_name}'. "
+        f"{detail} Labels must match exactly (case-insensitive); use "
+        "get_field_info to see all values, or operator 'in' for several."
     )
 
 
@@ -514,11 +531,25 @@ def _build_query_body(
     return body
 
 
+# Upper bound on samples requested per flight. EMS spaces ``size`` samples
+# evenly across the requested window.
+_MAX_SAMPLES: int = 5000
+
+# Rows shown per flight before the output is truncated.
+_MAX_DISPLAY_ROWS: int = 200
+
+
+def _sample_count(span_seconds: float, sample_rate: float) -> int:
+    """Number of samples for a window, at least 1 and at most ``_MAX_SAMPLES``."""
+    return min(_MAX_SAMPLES, max(1, int(span_seconds * sample_rate)))
+
+
 def _build_analytics_body(
     analytics: list[str],
     start_offset: float | None,
     end_offset: float | None,
     sample_rate: float,
+    size: int | None = None,
 ) -> dict[str, Any]:
     """Build the EMS API analytics query request body.
 
@@ -527,6 +558,9 @@ def _build_analytics_body(
         start_offset: Start time in seconds from flight start.
         end_offset: End time in seconds from flight start.
         sample_rate: Samples per second.
+        size: Explicit sample count (e.g. computed from the flight's actual
+            span when an offset was omitted). When None, derived from the
+            offsets, or ``_MAX_SAMPLES`` if either offset is missing.
 
     Returns:
         EMS API analytics query request body dict.
@@ -540,16 +574,73 @@ def _build_analytics_body(
     if end_offset is not None:
         body["end"] = end_offset
 
-    if start_offset is not None and end_offset is not None:
-        size = int((end_offset - start_offset) * sample_rate)
-        if size > 0:
-            body["size"] = size
-    else:
-        # Always include a size to ensure the API returns data even without
-        # explicit time range boundaries
-        body["size"] = 5000
+    if size is None:
+        if start_offset is not None and end_offset is not None:
+            size = _sample_count(end_offset - start_offset, sample_rate)
+        else:
+            size = _MAX_SAMPLES
+    body["size"] = size
 
     return body
+
+
+async def _probe_flight_span(
+    client: Any,
+    path: str,
+    analytic_id: str,
+    start_offset: float | None,
+    end_offset: float | None,
+) -> tuple[float, float] | None:
+    """Find the actual [start, end] offsets of a flight window.
+
+    Asking EMS for 2 evenly spaced samples returns the window's first and
+    last offsets, which is how a missing start/end offset is filled in so
+    ``sample_rate`` can be honoured for whole-flight requests.
+    """
+    body: dict[str, Any] = {"select": [{"analyticId": analytic_id}], "size": 2}
+    if start_offset is not None:
+        body["start"] = start_offset
+    if end_offset is not None:
+        body["end"] = end_offset
+    try:
+        data = await client.post(path, json=body)
+    except EMSAPIError:
+        return None
+    offsets = data.get("offsets") or []
+    if len(offsets) < 2:
+        return None
+    return float(offsets[0]), float(offsets[-1])
+
+
+def _fmt_offset(value: Any) -> Any:
+    """Round a time offset to 0.01 s for display."""
+    if isinstance(value, float):
+        return round(value, 2)
+    return value
+
+
+def _fmt_value(value: Any) -> Any:
+    """Trim float noise to 6 significant figures for display."""
+    if isinstance(value, float) and value == value and value not in (float("inf"), float("-inf")):
+        return float(f"{value:.6g}")
+    return value
+
+
+def _truncation_note(offsets: list[Any], shown: int) -> str:
+    """Explain a truncated time series and how to get the part that's missing."""
+    total = len(offsets)
+    first, last_shown, last = offsets[0], offsets[shown - 1], offsets[-1]
+    span = float(last) - float(first)
+    hint = ""
+    if span > 0:
+        hint = (
+            f" Lower sample_rate (about {shown / span:.3g} gives ~{shown} rows over "
+            "this window) or narrow start_offset/end_offset to see the rest."
+        )
+    return (
+        f"Showing {shown} of {total} samples: offsets {_fmt_offset(first)}-"
+        f"{_fmt_offset(last_shown)} s of {_fmt_offset(first)}-{_fmt_offset(last)} s.{hint}"
+    )
 
 
 def _format_query_results(
@@ -620,9 +711,40 @@ def _format_query_results(
     return "\n".join(lines)
 
 
+def _analytics_columns(
+    analytic_results: list[dict[str, Any]],
+    analytic_names: list[str] | None,
+) -> list[str]:
+    """Column names for analytics output: display names, else shortened IDs."""
+    cols: list[str] = []
+    for i, ar in enumerate(analytic_results):
+        if analytic_names and i < len(analytic_names):
+            cols.append(analytic_names[i])
+        else:
+            raw_id = str(ar.get("analyticId", f"Analytic_{i}"))
+            cols.append(_format_analytic_header(raw_id))
+    return cols
+
+
+def _all_zero(analytic_results: list[dict[str, Any]], total_rows: int) -> bool:
+    """True when a long series is entirely 0.0/None (often a bad flight ID)."""
+    if total_rows < 100 or not analytic_results:
+        return False
+    return all(
+        all(v == 0.0 or v is None for v in ar.get("values", []))
+        for ar in analytic_results
+    )
+
+
+_ALL_ZERO_WARNING = (
+    "WARNING: All analytic values are 0.0. This may indicate an invalid "
+    "flight ID. Verify the flight ID using query_database."
+)
+
+
 def _format_analytics_results(
     results: list[dict[str, Any]],
-    max_rows_per_flight: int = 200,
+    max_rows_per_flight: int = _MAX_DISPLAY_ROWS,
     analytic_names: list[str] | None = None,
 ) -> str:
     """Format analytics query results as per-flight time-series tables.
@@ -631,7 +753,8 @@ def _format_analytics_results(
         {"offsets": [0, 1, 2, ...], "results": [{"analyticId": "...", "values": [...]}, ...]}
 
     Args:
-        results: List of per-flight result dicts with flight_id, data or error.
+        results: List of per-flight result dicts with flight_id, data or
+            error, and optional ``notes`` (informational lines).
         max_rows_per_flight: Maximum display rows per flight.
         analytic_names: Optional display names for analytics columns. When
             provided, these are used as column headers instead of raw analytic IDs.
@@ -648,6 +771,7 @@ def _format_analytics_results(
     for r in results:
         flight_id = r.get("flight_id", "?")
         section_lines: list[str] = [f"=== Flight {flight_id} ==="]
+        section_lines.extend(f"Note: {n}" for n in r.get("notes", []))
 
         if "error" in r:
             section_lines.append(f"Error: {r['error']}")
@@ -664,80 +788,41 @@ def _format_analytics_results(
             sections.append("\n".join(section_lines))
             continue
 
-        # Column names: Offset + display names (or formatted IDs as fallback)
-        col_names = ["Offset"]
-        for i, ar in enumerate(analytic_results):
-            if analytic_names and i < len(analytic_names):
-                col_names.append(analytic_names[i])
-            else:
-                raw_id = str(ar.get("analyticId", f"Analytic_{i}"))
-                col_names.append(_format_analytic_header(raw_id))
+        col_names = ["Offset"] + _analytics_columns(analytic_results, analytic_names)
+        total_rows = len(offsets)
+        if _all_zero(analytic_results, total_rows):
+            section_lines.append(_ALL_ZERO_WARNING)
 
-        # Build rows: each row is [offset, value1, value2, ...]
-        data_rows: list[list[Any]] = []
-        for i, offset in enumerate(offsets):
-            row: list[Any] = [offset]
-            for ar in analytic_results:
-                values = ar.get("values", [])
-                row.append(values[i] if i < len(values) else None)
-            data_rows.append(row)
-
-        # Check for suspicious all-zero data (possible invalid flight ID)
-        total_rows = len(data_rows)
-        if total_rows >= 100 and analytic_results:
-            all_zero = True
-            for ar in analytic_results:
-                values = ar.get("values", [])
-                if any(v != 0.0 and v is not None for v in values):
-                    all_zero = False
-                    break
-            if all_zero:
-                section_lines.append(
-                    "WARNING: All analytic values are 0.0. This may indicate "
-                    "an invalid flight ID. Verify the flight ID using query_database."
-                )
-
-        # Convert to string rows
-        display_rows = data_rows[:max_rows_per_flight]
+        shown = min(total_rows, max_rows_per_flight)
         str_rows: list[list[str]] = []
-        for row in display_rows:
-            str_row: list[str] = []
-            for cell in row:
-                if cell is None:
-                    str_row.append("NULL")
-                else:
-                    str_row.append(str(cell))
-            str_rows.append(str_row)
+        for i in range(shown):
+            row = [str(_fmt_offset(offsets[i]))]
+            for ar in analytic_results:
+                values = ar.get("values", [])
+                v = values[i] if i < len(values) else None
+                row.append("NULL" if v is None else str(_fmt_value(v)))
+            str_rows.append(row)
 
-        # Calculate column widths
-        col_widths: list[int] = [len(n) for n in col_names]
+        col_widths = [len(n) for n in col_names]
         for row in str_rows:
             for i, cell in enumerate(row):
                 if i < len(col_widths):
                     col_widths[i] = max(col_widths[i], len(cell))
-
-        # Cap widths at 40
         col_widths = [min(w, 40) for w in col_widths]
 
-        # Header
-        header_line = " | ".join(col_names[i].rjust(col_widths[i]) for i in range(len(col_names)))
-        section_lines.append(header_line)
-
-        sep_line = "-+-".join("-" * w for w in col_widths)
-        section_lines.append(sep_line)
-
-        # Data rows (right-aligned for numeric data)
+        section_lines.append(
+            " | ".join(col_names[i].rjust(col_widths[i]) for i in range(len(col_names)))
+        )
+        section_lines.append("-+-".join("-" * w for w in col_widths))
         for row in str_rows:
-            cells: list[str] = []
-            for i, w in enumerate(col_widths):
-                val = row[i] if i < len(row) else ""
-                cells.append(val.rjust(w))
+            cells = [
+                (row[i] if i < len(row) else "").rjust(w)
+                for i, w in enumerate(col_widths)
+            ]
             section_lines.append(" | ".join(cells))
 
-        if total_rows > max_rows_per_flight:
-            section_lines.append(
-                f"... ({total_rows - max_rows_per_flight} more rows, " f"{total_rows} total)"
-            )
+        if total_rows > shown:
+            section_lines.append(_truncation_note(offsets, shown))
         else:
             section_lines.append(f"({total_rows} row(s))")
 
@@ -797,7 +882,7 @@ def _format_query_results_csv(
     col_names = _extract_column_names(headers_raw, fields)
 
     output = io.StringIO()
-    writer = csv.writer(output, quoting=csv.QUOTE_MINIMAL)
+    writer = csv.writer(output, quoting=csv.QUOTE_MINIMAL, lineterminator="\n")
     writer.writerow(col_names)
     for row in rows:
         writer.writerow(["" if cell is None else cell for cell in row])
@@ -844,7 +929,7 @@ def _format_query_results_json(
 
 def _format_analytics_results_csv(
     results: list[dict[str, Any]],
-    max_rows_per_flight: int = 200,
+    max_rows_per_flight: int = _MAX_DISPLAY_ROWS,
     analytic_names: list[str] | None = None,
 ) -> str:
     """Format analytics results as CSV with per-flight comment headers.
@@ -861,11 +946,14 @@ def _format_analytics_results_csv(
         return "No analytics results."
 
     output = io.StringIO()
-    writer = csv.writer(output, quoting=csv.QUOTE_MINIMAL)
+    # "\n" (not csv's default "\r\n") so data rows match the comment lines.
+    writer = csv.writer(output, quoting=csv.QUOTE_MINIMAL, lineterminator="\n")
 
     for r in results:
         flight_id = r.get("flight_id", "?")
         output.write(f"# Flight {flight_id}\n")
+        for note in r.get("notes", []):
+            output.write(f"# Note: {note}\n")
 
         if "error" in r:
             output.write(f"# Error: {r['error']}\n")
@@ -879,44 +967,23 @@ def _format_analytics_results_csv(
             output.write("# No data returned.\n")
             continue
 
-        # Column headers
-        col_names = ["Offset"]
-        for i, ar in enumerate(analytic_results):
-            if analytic_names and i < len(analytic_names):
-                col_names.append(analytic_names[i])
-            else:
-                raw_id = str(ar.get("analyticId", f"Analytic_{i}"))
-                col_names.append(_format_analytic_header(raw_id))
+        writer.writerow(["Offset"] + _analytics_columns(analytic_results, analytic_names))
 
-        writer.writerow(col_names)
-
-        # All-zero warning
         total_rows = len(offsets)
-        if total_rows >= 100 and analytic_results:
-            all_zero = all(
-                all(v == 0.0 or v is None for v in ar.get("values", []))
-                for ar in analytic_results
-            )
-            if all_zero:
-                output.write(
-                    "# WARNING: All analytic values are 0.0. "
-                    "This may indicate an invalid flight ID.\n"
-                )
+        if _all_zero(analytic_results, total_rows):
+            output.write(f"# {_ALL_ZERO_WARNING}\n")
 
-        # Data rows
-        display_count = min(total_rows, max_rows_per_flight)
-        for i in range(display_count):
-            row: list[Any] = [offsets[i]]
+        shown = min(total_rows, max_rows_per_flight)
+        for i in range(shown):
+            row: list[Any] = [_fmt_offset(offsets[i])]
             for ar in analytic_results:
                 values = ar.get("values", [])
-                row.append(values[i] if i < len(values) else "")
+                v = values[i] if i < len(values) else None
+                row.append("" if v is None else _fmt_value(v))
             writer.writerow(row)
 
-        if total_rows > max_rows_per_flight:
-            output.write(
-                f"# ... ({total_rows - max_rows_per_flight} more rows, "
-                f"{total_rows} total)\n"
-            )
+        if total_rows > shown:
+            output.write(f"# {_truncation_note(offsets, shown)}\n")
         else:
             output.write(f"# ({total_rows} row(s))\n")
 
@@ -925,7 +992,7 @@ def _format_analytics_results_csv(
 
 def _format_analytics_results_json(
     results: list[dict[str, Any]],
-    max_rows_per_flight: int = 200,
+    max_rows_per_flight: int = _MAX_DISPLAY_ROWS,
     analytic_names: list[str] | None = None,
 ) -> str:
     """Format analytics results as compact JSON.
@@ -946,12 +1013,10 @@ def _format_analytics_results_json(
 
     for r in results:
         flight_id = r.get("flight_id", "?")
+        warnings.extend(f"Flight {flight_id}: {n}" for n in r.get("notes", []))
 
         if "error" in r:
-            flights_out.append({
-                "flight_id": flight_id,
-                "error": r["error"],
-            })
+            flights_out.append({"flight_id": flight_id, "error": r["error"]})
             continue
 
         data = r.get("data", {})
@@ -959,54 +1024,166 @@ def _format_analytics_results_json(
         analytic_results = data.get("results", [])
 
         if not offsets:
-            flights_out.append({
-                "flight_id": flight_id,
-                "rows": [],
-                "row_count": 0,
-            })
+            flights_out.append({"flight_id": flight_id, "rows": [], "row_count": 0})
             continue
 
-        # Column names
-        col_names = []
-        for i, ar in enumerate(analytic_results):
-            if analytic_names and i < len(analytic_names):
-                col_names.append(analytic_names[i])
-            else:
-                raw_id = str(ar.get("analyticId", f"Analytic_{i}"))
-                col_names.append(_format_analytic_header(raw_id))
-
-        # All-zero warning
+        col_names = _analytics_columns(analytic_results, analytic_names)
         total_rows = len(offsets)
-        if total_rows >= 100 and analytic_results:
-            all_zero = all(
-                all(v == 0.0 or v is None for v in ar.get("values", []))
-                for ar in analytic_results
-            )
-            if all_zero:
-                warnings.append(
-                    f"Flight {flight_id}: All analytic values are 0.0. "
-                    "This may indicate an invalid flight ID."
-                )
+        if _all_zero(analytic_results, total_rows):
+            warnings.append(f"Flight {flight_id}: {_ALL_ZERO_WARNING}")
 
-        # Build rows
-        display_count = min(total_rows, max_rows_per_flight)
+        shown = min(total_rows, max_rows_per_flight)
         row_dicts = []
-        for i in range(display_count):
-            row_dict: dict[str, Any] = {"Offset": offsets[i]}
+        for i in range(shown):
+            row_dict: dict[str, Any] = {"Offset": _fmt_offset(offsets[i])}
             for j, ar in enumerate(analytic_results):
                 values = ar.get("values", [])
                 col = col_names[j] if j < len(col_names) else f"Analytic_{j}"
-                row_dict[col] = values[i] if i < len(values) else None
+                row_dict[col] = _fmt_value(values[i]) if i < len(values) else None
             row_dicts.append(row_dict)
 
-        flights_out.append({
+        flight_out: dict[str, Any] = {
             "flight_id": flight_id,
             "rows": row_dicts,
             "row_count": total_rows,
-        })
+        }
+        if total_rows > shown:
+            flight_out["truncated"] = _truncation_note(offsets, shown)
+        flights_out.append(flight_out)
 
     result = {"flights": flights_out, "warnings": warnings}
     return json.dumps(result, separators=(",", ":"))
+
+
+# Day/month/year-style dates ("02/11/2026", "2-11-26"). EMS parses these as
+# US month/day, which silently swaps day and month for Australian input.
+_NON_ISO_DATE = re.compile(r"^\s*\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}(\s|T|$)")
+
+
+def _describe_filter(f: Any) -> str:
+    """Short human-readable form of a filter, e.g. "Takeoff Valid = True"."""
+    op_symbols = {
+        "equal": "=", "notEqual": "!=", "greaterThan": ">",
+        "greaterThanOrEqual": ">=", "lessThan": "<", "lessThanOrEqual": "<=",
+    }
+    op = f.get("operator", "equal")
+    symbol = op_symbols.get(op, op)
+    if op in UNARY_OPERATORS:
+        return f"{f.get('field_id')} {op}"
+    return f"{f.get('field_id')} {symbol} {f.get('value')}"
+
+
+# The "[N]" display form of a reference (as opposed to a bare number).
+_BRACKETED_REF = re.compile(r"^\s*\[\d+\]\s*$")
+
+
+def _event_value_entry(ref: Any) -> dict[str, Any] | None:
+    """Stored entry for an event-value [N] ref from find_event_types, else None."""
+    ref_num = _parse_ref_number(ref)
+    if ref_num is None:
+        return None
+    entry = _get_stored_result(ref_num)
+    if entry is not None and entry.get("type") == "event-value":
+        return entry
+    return None
+
+
+def _event_code(entry: dict[str, Any]) -> Any:
+    """Numeric Event Type code stored on an event-value entry."""
+    code = entry["id"]
+    try:
+        return int(code)
+    except (TypeError, ValueError):
+        return code
+
+
+def _normalize_filters(
+    filters: list[QueryFilter],
+    ems_system_id: int,
+    database_id: str,
+) -> list[QueryFilter]:
+    """Validate and normalise filters before field resolution.
+
+    * Event-value [N] refs (from find_event_types) expand: as ``field_id``
+      they become the profile's Event Type field, and as values -- only in
+      the explicit "[N]" string form -- they become the event's numeric
+      code. Value refs must come from the database being queried.
+    * ``in`` with a scalar value is wrapped into a one-item list.
+    * Non-ISO dates are rejected, because EMS would read 02/11/2026 as
+      11 Feb rather than 2 Nov.
+
+    Raises:
+        ValueError: On a non-ISO date or an event ref from another database.
+    """
+    normalized: list[QueryFilter] = []
+    for f in filters:
+        new_f: dict[str, Any] = dict(f)
+        op = new_f["operator"]
+
+        field_entry = _event_value_entry(new_f.get("field_id"))
+        if field_entry is not None:
+            if field_entry.get("database_id") != database_id:
+                raise ValueError(
+                    f"event reference {new_f['field_id']} ('{field_entry['name']}') belongs "
+                    "to a different profile database. Query the database shown next "
+                    "to it in find_event_types (database_id=\"[N]\")."
+                )
+            if not field_entry.get("event_type_field_id"):
+                raise ValueError(
+                    f"event reference {new_f['field_id']} has no Event Type field "
+                    "recorded; re-run find_event_types."
+                )
+            new_f["field_id"] = field_entry["event_type_field_id"]
+            if "value" not in new_f or new_f["value"] is None:
+                new_f["value"] = (
+                    [_event_code(field_entry)] if op == "in" else _event_code(field_entry)
+                )
+
+        value = new_f.get("value")
+        if op == "in" and value is not None and not isinstance(value, (list, tuple)):
+            value = [value]
+
+        def _convert(v: Any) -> Any:
+            # Only the explicit "[N]" form counts as an event ref in a value:
+            # a bare "1" is an ordinary literal (e.g. Flight Number == "1")
+            # and must never be swapped for whatever ref [1] happens to be.
+            is_bracketed = isinstance(v, str) and _BRACKETED_REF.match(v) is not None
+            entry = _event_value_entry(v) if is_bracketed else None
+            if entry is not None:
+                # A code is only meaningful within its own profile's Event Type
+                # field; the same number can be a different event elsewhere.
+                if entry.get("ems_system_id") != ems_system_id or (
+                    entry.get("database_id") != database_id
+                ):
+                    raise ValueError(
+                        f"event reference {v} ('{entry['name']}') belongs to a "
+                        "different profile database. Use event refs from the "
+                        "profile you are querying (see find_event_types)."
+                    )
+                if field_entry is not None and (
+                    entry.get("event_type_field_id") != field_entry.get("event_type_field_id")
+                ):
+                    raise ValueError(
+                        f"event reference {v} ('{entry['name']}') is for a different "
+                        f"Event Type field than {f.get('field_id')}."
+                    )
+                return _event_code(entry)
+            if isinstance(v, str) and _NON_ISO_DATE.match(v):
+                raise ValueError(
+                    f"ambiguous date {v!r}. Use ISO format YYYY-MM-DD (optionally "
+                    "with a time, e.g. 2026-11-02T06:00:00) -- EMS reads slash dates "
+                    "as month/day."
+                )
+            return v
+
+        if isinstance(value, (list, tuple)):
+            value = [_convert(v) for v in value]
+        elif value is not None:
+            value = _convert(value)
+        if "value" in new_f or value is not None:
+            new_f["value"] = value
+        normalized.append(new_f)  # type: ignore[arg-type]
+    return normalized
 
 
 @mcp.tool
@@ -1034,17 +1211,26 @@ async def query_database(
     Best-practice filters are applied automatically (apply_best_practice_filters=True
     by default): FDW Flights gets Takeoff Valid == true AND Landing Valid == true;
     profile fields get Processing State == "Succeeded"; profile event fields also
-    get False Positive == "Not a False Positive". User-provided filters always
-    take precedence over auto-suggested ones. Set apply_best_practice_filters=False
-    to disable (e.g. when explicitly querying invalid flights).
+    get False Positive == "Not a False Positive". User-provided filters on the
+    same field always take precedence over auto-suggested ones. The filters
+    actually applied are listed at the end of the result. Set
+    apply_best_practice_filters=False to disable (e.g. when explicitly
+    querying invalid flights).
+
+    Field names must match exactly; a near-miss returns the closest fields
+    as [N] refs rather than silently querying a different field.
 
     Args:
         ems_system_id: EMS system ID.
-        database_id: Database ID or name (e.g. "FDW Flights").
-        fields: Fields to retrieve. Each has field_id (name, [N] ref, or
+        database_id: Database name (e.g. "FDW Flights"), ID, or an event-profile
+            [N] ref from list_event_profiles / find_event_types.
+        fields: Fields to retrieve. Each has field_id (exact name, [N] ref, or
             bracket ID), optional alias, optional aggregate.
         filters: Filter conditions (AND-combined). Each has field_id, operator
             (equal/notEqual/greaterThan/lessThan/between/in/like/isNull/etc.), value.
+            Dates must be ISO (e.g. "2026-11-02"); 'between' takes [min, max];
+            'in' takes a list. An event [N] ref from find_event_types can be the
+            field_id (expands to Event Type == that event).
         order_by: Sort order. Each has field_id, optional direction (asc/desc).
         limit: Max rows (1-10000, default: 100).
         format: 'display' (human-readable, default) or 'raw' (numeric codes).
@@ -1092,9 +1278,16 @@ async def query_database(
     except ValueError as e:
         return f"Error resolving database: {e}"
 
+    if filters:
+        try:
+            filters = _normalize_filters(filters, ems_system_id, database_id)
+        except ValueError as e:
+            return f"Error in filters: {e}"
+
     # Auto-apply best-practice filters unless the caller opted out.
     # We do this before field resolution so the original [N] references and
     # field names are still available for result-store lookups.
+    bp_count = 0
     if apply_best_practice_filters:
         field_refs = [f["field_id"] for f in fields]
         bp_bundle, _ = _compute_best_practice_filter_bundle(
@@ -1103,7 +1296,11 @@ async def query_database(
         if bp_bundle:
             # Prepend best-practice filters; user filters follow so they
             # always override auto-suggested ones for the same field.
-            filters = bp_bundle + (filters or [])
+            bp_count = len(bp_bundle)
+            filters = bp_bundle + list(filters or [])  # type: ignore[assignment]
+    auto_filter_labels = [
+        _describe_filter(f) for f in (filters or [])[:bp_count]
+    ]
 
     # Resolve field references -> opaque IDs
     try:
@@ -1121,14 +1318,24 @@ async def query_database(
     if filters:
         try:
             resolved_filters: list[QueryFilter] = []
-            for f in filters:
+            for flt in filters:
                 resolved_id = await _resolve_field_id(
-                    f["field_id"], ems_system_id, database_id
+                    flt["field_id"], ems_system_id, database_id
                 )
-                resolved_filters.append({**f, "field_id": resolved_id})
-            filters = resolved_filters
+                resolved_filters.append({**flt, "field_id": resolved_id})
         except (ValueError, EMSAPIError) as e:
             return f"Error resolving filter field: {e}"
+        # The name-based skip in the bundle cannot see a user filter given as
+        # an [N] ref or raw ID for the same field, so drop any auto filter
+        # whose resolved field the user also filtered on -- user choice wins.
+        user_ids = {f["field_id"] for f in resolved_filters[bp_count:]}
+        kept_auto = [
+            (label, flt)
+            for label, flt in zip(auto_filter_labels, resolved_filters[:bp_count], strict=True)
+            if flt["field_id"] not in user_ids
+        ]
+        auto_filter_labels = [label for label, _ in kept_auto]
+        filters = [flt for _, flt in kept_auto] + resolved_filters[bp_count:]
 
     # Resolve field references in order_by
     if order_by:
@@ -1175,12 +1382,21 @@ async def query_database(
             row_count = len(response.get("rows", []))
             await ctx.report_progress(3, 3, f"Formatting {row_count} rows...")
 
+        if output_format == "json":
+            payload = json.loads(_format_query_results_json(response, fields))
+            if auto_filter_labels:
+                payload["auto_filters"] = auto_filter_labels
+            return json.dumps(payload, separators=(",", ":"))
         if output_format == "csv":
-            return _format_query_results_csv(response, fields)
-        elif output_format == "json":
-            return _format_query_results_json(response, fields)
+            formatted = _format_query_results_csv(response, fields)
         else:
-            return _format_query_results(response, fields)
+            formatted = _format_query_results(response, fields)
+        if auto_filter_labels:
+            formatted += (
+                f"\n(Auto-applied data-quality filters: {'; '.join(auto_filter_labels)}. "
+                "Pass apply_best_practice_filters=False to include excluded records.)"
+            )
+        return formatted
     except EMSNotFoundError:
         return (
             f"Error: Database or system not found. "
@@ -1197,6 +1413,16 @@ async def query_database(
         return f"Error executing query: {e.message}"
 
 
+def _has_no_values(data: dict[str, Any]) -> bool:
+    """True when an analytics response has no offsets or only None values."""
+    if not data.get("offsets"):
+        return True
+    return all(
+        all(v is None for v in ar.get("values", []))
+        for ar in data.get("results", [])
+    )
+
+
 @mcp.tool
 async def query_flight_analytics(
     ems_system_id: int,
@@ -1210,17 +1436,27 @@ async def query_flight_analytics(
 ) -> str:
     """Get time-series data (altitude, airspeed, etc.) for specific flights.
 
-    Flight IDs come from query_database. Accepts human-readable analytic names
-    (e.g. "Airspeed") which are resolved automatically, or raw IDs from
-    search_analytics.
+    Flight IDs come from query_database ('Flight Record' field). Analytics are
+    given as exact names (e.g. "Pressure Altitude (ft)"), [N] references from
+    search_analytics / find_physical_params, or raw IDs. Names must match
+    exactly -- generic names like "Altitude" return the closest candidates
+    instead of guessing. Raw recorder (physical) parameters only resolve via
+    their [N] from find_physical_params.
+
+    Without start_offset/end_offset the whole flight is sampled at
+    sample_rate (capped at 5000 samples). At most 200 rows per flight are
+    displayed; the output says which offsets were shown and how to get the
+    rest.
 
     Args:
         ems_system_id: EMS system ID.
         flight_ids: Flight record IDs (max 10, from query_database).
-        analytics: Analytic names or IDs (max 20). e.g. ["Airspeed", "Altitude"].
-        start_offset: Start time in seconds from flight start.
-        end_offset: End time in seconds from flight start.
-        sample_rate: Samples per second (default: 1.0).
+        analytics: Analytic names, [N] refs, or IDs (max 20), e.g.
+            ["Pressure Altitude (ft)", "Airspeed (Calibrated; 1 or only) (knots)"].
+        start_offset: Start time in seconds from flight start (optional).
+        end_offset: End time in seconds from flight start (optional).
+        sample_rate: Samples per second (default: 1.0). For a whole-flight
+            overview, ~0.05 gives about one sample every 20 s.
         output_format: 'csv' (default, compact), 'table' (human-readable), or
             'json' (structured).
 
@@ -1267,7 +1503,15 @@ async def query_flight_analytics(
     display_names = [name for name, _ in resolved]
     analytic_ids = [aid for _, aid in resolved]
 
-    body = _build_analytics_body(analytic_ids, start_offset, end_offset, sample_rate)
+    # Physical-parameter refs remember the flight(s) they were discovered on;
+    # used below to explain empty results on a flight with a different frame.
+    ref_origins: list[tuple[str, list[int]]] = []
+    for item in analytics:
+        ref_num = _parse_ref_number(item)
+        entry = _get_stored_result(ref_num) if ref_num is not None else None
+        if entry is not None and entry.get("flight_ids"):
+            ref_origins.append((f"[{ref_num}]", list(entry["flight_ids"])))
+
     client = get_client()
 
     results: list[dict[str, Any]] = []
@@ -1279,23 +1523,57 @@ async def query_flight_analytics(
                 f"Querying flight {fid} ({i + 1}/{len(flight_ids)})...",
             )
         path = f"/api/v2/ems-systems/{ems_system_id}/flights/{fid}/analytics/query"
+        notes: list[str] = []
+        size: int | None = None
+        if start_offset is None or end_offset is None:
+            # Without both offsets EMS spreads ``size`` samples over the whole
+            # window, so derive size from the real span to honour sample_rate.
+            span = await _probe_flight_span(
+                client, path, analytic_ids[0], start_offset, end_offset,
+            )
+            if span is not None:
+                wanted = max(1, int((span[1] - span[0]) * sample_rate))
+                size = _sample_count(span[1] - span[0], sample_rate)
+                if wanted > size and span[1] > span[0]:
+                    notes.append(
+                        f"sample_rate {sample_rate} over {span[1] - span[0]:.0f} s would need "
+                        f"{wanted} samples; capped at {size} "
+                        f"(~{size / (span[1] - span[0]):.3g} samples/s)."
+                    )
+        body = _build_analytics_body(
+            analytic_ids, start_offset, end_offset, sample_rate, size=size,
+        )
         try:
             data = await client.post(path, json=body)
-            results.append({"flight_id": fid, "data": data})
+            entry_out: dict[str, Any] = {"flight_id": fid, "data": data}
         except EMSNotFoundError:
-            results.append(
-                {
-                    "flight_id": fid,
-                    "error": f"Flight {fid} not found in EMS system {ems_system_id}.",
-                }
-            )
+            entry_out = {
+                "flight_id": fid,
+                "error": (
+                    f"Flight {fid} not found in EMS system {ems_system_id}. Get flight "
+                    "record IDs from query_database on 'FDW Flights'."
+                ),
+            }
         except EMSAPIError as e:
-            results.append(
-                {
-                    "flight_id": fid,
-                    "error": f"API error: {e.message}",
-                }
-            )
+            entry_out = {
+                "flight_id": fid,
+                "error": (
+                    f"API error: {e.message} -- if this flight ID did not come from "
+                    "query_database it may not exist (EMS reports unknown flights as "
+                    "access or query failures)."
+                ),
+            }
+        if "data" in entry_out and _has_no_values(entry_out["data"]):
+            for ref, origin in ref_origins:
+                if fid not in origin:
+                    notes.append(
+                        f"{ref} was discovered on flight {origin[0]}; it may not exist "
+                        f"in this flight's recorder frame. Run "
+                        f"find_physical_params(flight_id={fid}) to find its equivalent."
+                    )
+        if notes:
+            entry_out["notes"] = notes
+        results.append(entry_out)
 
     if ctx:
         await ctx.report_progress(total_steps, total_steps, "Formatting results...")
@@ -1312,7 +1590,7 @@ async def query_flight_analytics(
     if all("error" in r for r in results):
         formatted = formatter(results, analytic_names=display_names)
         return (
-            f"All {len(flight_ids)} flight(s) failed. "
+            f"Error: all {len(flight_ids)} flight(s) failed. "
             "Verify flight IDs (from query_database) and analytic IDs (from search_analytics).\n\n"
             + formatted
         )

@@ -10,6 +10,8 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
+from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 
 from ems_mcp.api.client import EMSClient
 from ems_mcp.config import get_settings
@@ -68,32 +70,35 @@ EMS flight data analytics server. Follow this workflow:
 
 DISCOVERY (required before querying):
 1. list_ems_systems -> get system ID (usually 1)
-2. list_databases -> find database names (e.g. "FDW Flights"). Each \
-database is annotated [searchable] or [entity-type] so you know which \
-find_fields mode to use before calling it.
-3. find_fields(mode="search") -> find fields by keyword. ALWAYS pass a \
-list to search_text to look up ALL needed terms in one call -- this \
-collapses N round-trips into one and is dramatically more token-efficient \
-(e.g. search_text=["fuel burn", "tail number", "takeoff airport", \
-"flight date", "aircraft type"]). Each term is cached individually.
+2. Database: for flight records use "FDW Flights" by name directly -- no \
+need to browse. list_databases shows only groups at the root; databases \
+(annotated [searchable] or [entity-type]) appear one level down \
+(FDW Flights is under the "FDW" group).
+3. find_fields -> find fields by keyword. ALWAYS pass a list to \
+search_text to look up ALL needed terms in one call (e.g. \
+search_text=["fuel burn", "tail number", "takeoff airport", "flight \
+date"]). FDW Flights is an entity-type database, so this runs as a deep \
+(tree) search automatically; the default mode is fine.
 4. Discrete value mappings: pass include_field_info=True to find_fields \
 to get mappings inline, or call get_field_info separately on specific fields.
+5. Field names passed to other tools must match EXACTLY. A near-miss is \
+never substituted silently: you get an error listing the closest fields \
+as [N] refs -- pick one deliberately.
 
 EVENT QUESTIONS (hard landing, tail strike, GPWS, unstable approach, \
 exceedance, runway excursion, etc.):
 Event names are DISCRETE VALUES inside each APM profile's Event Type \
 field, not field names. find_fields will NOT find them. Workflow:
   a. list_event_profiles(ems_system_id [, name_filter="..."]) -- returns \
-APM event profiles (P14, P40, P600, ...) with descriptions. Some EMS \
-deployments have thousands of profiles, so pass name_filter (e.g. \
-name_filter="landing" or "strike") to narrow the catalog server-side \
-when you have a keyword.
-  b. find_event_types(ems_system_id, query, profiles=[...]) -- pass \
-profile codes from (a) to bound the scan. If you don't yet know which \
-profile, OMIT profiles= and the tool will auto-shortlist by query match \
-(capped, with a clear error if too many candidates). Returns \
-[N]-referenced event values you can use as Event Type filters in \
-query_database.
+APM event profiles with an [N] ref, P-code (when the name has one) and \
+description. Pass name_filter (e.g. "landing" or "strike") to narrow it.
+  b. find_event_types(ems_system_id, query, profiles=[...]) -- pass P-codes \
+or [N] refs from (a) ([N] works for profiles without a code). If you don't \
+yet know which profile, OMIT profiles= and the tool auto-shortlists. \
+Returns [N]-referenced event values plus a database [N] for each profile.
+  c. query_database(database_id="[db N]", fields=[...], \
+filters=[{"field_id": "[event N]", "operator": "equal"}]) -- the event \
+ref expands to that profile's Event Type == code.
 
 FIELD REFERENCES:
 - find_fields returns numbered [N] references. Use these directly in \
@@ -110,27 +115,35 @@ QUERYING:
 - query_database: SQL-like queries on flight records. Supports filters, \
 aggregation (avg/count/max/min/sum), and sorting. Best-practice data \
 quality filters (Takeoff Valid, Landing Valid, Processing State, etc.) \
-are applied automatically -- set apply_best_practice_filters=False only \
-when you explicitly want to include invalid/unprocessed records.
-- query_flight_analytics: Time-series data (altitude, airspeed, etc.) \
-for specific flights. Accepts human-readable analytic names, or [N] \
-references from search_analytics / find_physical_params.
+are applied automatically and listed at the end of the result -- set \
+apply_best_practice_filters=False only when you explicitly want to \
+include invalid/unprocessed records. Dates must be ISO (YYYY-MM-DD).
+- query_flight_analytics: Time-series data for specific flights. Pass \
+exact analytic names (e.g. "Pressure Altitude (ft)", "Airspeed \
+(Calibrated; 1 or only) (knots)") or [N] references from search_analytics \
+/ find_physical_params. Generic names like "Altitude" are ambiguous -- \
+search_analytics first. Omitting start/end_offset covers the whole \
+flight at sample_rate; at most 200 rows per flight are shown, so lower \
+sample_rate or narrow the window for long spans.
 - find_physical_params: discover PHYSICAL (raw FDR-recorded) parameters \
 for a specific flight. These are NOT in search_analytics (which only \
 covers global computed analytics) -- they are a property of the flight's \
 frame configuration, so a flight_id is required. Use this when a parameter \
 is fleet/frame-specific (raw bleed valves, individual sensor channels) or \
 when search_analytics returns nothing/NULLs for a flight. Pass the [N] \
-references it returns straight to query_flight_analytics with the same \
-flight_id.
+references it returns (not the names) to query_flight_analytics with the \
+same flight_id; a ref from one flight may not exist on another fleet's \
+frame.
 
 KEY RULES:
 - Discrete fields use numeric codes internally. Pass string labels in \
 filters -- they are auto-resolved. Use get_field_info or \
 include_field_info=True to verify available values.
-- Entity-type databases: list_databases flags these as [entity-type]. \
-Use find_fields(mode="browse") to navigate or mode="deep" for BFS. \
-mode="search" does NOT work on entity-type databases.
+- Entity-type databases (flagged [entity-type] by list_databases, \
+including FDW Flights) have no keyword-search endpoint; find_fields runs \
+mode="deep" for them automatically. mode="browse" navigates the tree.
+- Tool failures are returned as errors starting with "Error"; read the \
+message -- it says what to do next.
 - get_assets returns reference data (fleets, aircraft, airports, flight phases).
 - Use search_analytics to find time-series parameter names before querying.
 
@@ -146,6 +159,32 @@ suggestions before the query; query_database applies them automatically.
 """,
     lifespan=lifespan,
 )
+
+
+class ErrorResultMiddleware(Middleware):
+    """Flag tool results that report a failure as MCP errors.
+
+    Tools return their failures as plain text beginning with "Error" so the
+    message stays readable and actionable. Without this, MCP clients would
+    see those as successful results; re-raising them as ToolError sets
+    ``isError: true`` on the tool result while keeping the same text.
+    """
+
+    async def on_call_tool(
+        self,
+        context: MiddlewareContext[Any],
+        call_next: CallNext[Any, Any],
+    ) -> Any:
+        result = await call_next(context)
+        content = getattr(result, "content", None) or []
+        if len(content) == 1:
+            text = getattr(content[0], "text", None)
+            if isinstance(text, str) and text.lstrip().startswith("Error"):
+                raise ToolError(text)
+        return result
+
+
+mcp.add_middleware(ErrorResultMiddleware())
 
 
 def get_client() -> EMSClient:

@@ -1,12 +1,13 @@
 """Unit tests for EMS MCP discovery tools."""
 
+import re
 import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from ems_mcp.api.client import EMSNotFoundError
+from ems_mcp.api.client import EMSAPIError, EMSNotFoundError
 from ems_mcp.tools.discovery import (
     _do_browse_fields,
     _do_search_fields,
@@ -162,7 +163,7 @@ class TestFormatters:
         assert long_id not in result
         assert "Test Field (string)" in result
         # The stored result should have the full ID
-        ref_entry = _get_stored_result(0)
+        ref_entry = _get_stored_result(1)
         assert ref_entry is not None
         assert ref_entry["id"] == long_id
 
@@ -186,11 +187,11 @@ class TestFormatters:
         result = _format_field_group(group, ems_system_id=1, database_id="db")
         # Long ID should not appear inline; numbered ref should be used.
         assert long_group_id not in result
-        assert "[0] Fuel" in result
+        assert "[1] Fuel" in result
         # Hint about how to drill should be present.
         assert "find_fields" in result
         # The stored result should be retrievable as a group entry.
-        entry = _get_stored_result(0)
+        entry = _get_stored_result(1)
         assert entry is not None
         assert entry["type"] == "group"
         assert entry["id"] == long_group_id
@@ -213,7 +214,7 @@ class TestFormatters:
         assert "Airspeed [number (knots)]" in result
         # Default: IDs hidden, numbered refs shown
         assert "ID:" not in result
-        assert "[0]" in result
+        assert "[1]" in result
         assert "[1]" in result
         assert "reference numbers or field names" in result
 
@@ -391,7 +392,7 @@ class TestFormatters:
         assert "Barometric altitude" in result
         # Default: IDs hidden, numbered refs shown
         assert "ID:" not in result
-        assert "[0]" in result
+        assert "[1]" in result
         assert "query_flight_analytics" in result
 
     def test_format_analytics_search_results_show_ids(self) -> None:
@@ -407,7 +408,8 @@ class TestFormatters:
         ]
         result = _format_analytics_search_results(analytics, show_ids=True)
         assert "ID: analytic-123" in result
-        assert "query_flight_analytics" not in result
+        # IDs are shown alongside the [N] ref, not instead of it.
+        assert "[1] Altitude (Baro)" in result
 
 
 class TestListEmsSystems:
@@ -617,14 +619,14 @@ class TestFindFieldsBrowse:
         mock_client.get = AsyncMock(side_effect=mock_get)
 
         with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
-            # First call lists root and assigns [0] to the Fuel subgroup.
+            # First call lists root and assigns [1] to the Fuel subgroup.
             await _find_fields(
                 ems_system_id=1, database_id="[ems-core]", mode="browse",
             )
             # Second call passes the numbered ref; should resolve to the long ID.
             result = await _find_fields(
                 ems_system_id=1, database_id="[ems-core]",
-                mode="browse", group_id=0,
+                mode="browse", group_id=1,
             )
 
         assert "Best Touchdown Fuel Quantity" in result
@@ -789,17 +791,30 @@ class TestFindFieldsSearch:
         assert mock_client.get.call_count == 1
 
     @pytest.mark.asyncio
-    async def test_search_fields_rejects_entity_type_database(self) -> None:
-        """Tool should reject entity-type database IDs proactively."""
-        result = await _find_fields(
-            ems_system_id=1,
-            database_id="[ems-core][entity-type][foqa-flights]",
-            mode="search",
-            search_text="altitude",
-        )
-        assert "Error" in result
-        assert "entity-type database" in result
-        assert "find_fields" in result or "mode='deep'" in result
+    async def test_search_on_entity_type_database_falls_back_to_deep(self) -> None:
+        """Search mode on an entity-type DB (e.g. FDW Flights) runs deep search
+        instead of failing, including for multi-term lists."""
+        group = {
+            "id": "[none]", "name": "Root",
+            "fields": [
+                {"id": "f-alt", "name": "Pressure Altitude", "type": "number"},
+                {"id": "f-tail", "name": "Tail Number", "type": "string"},
+            ],
+            "groups": [],
+        }
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value=group)
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _find_fields(
+                ems_system_id=1,
+                database_id="[ems-core][entity-type][foqa-flights]",
+                mode="search",
+                search_text=["altitude", "tail number"],
+            )
+        assert "mode='deep' was used instead" in result
+        assert 'Search: "altitude"' in result and "Pressure Altitude" in result
+        assert 'Search: "tail number"' in result and "Tail Number" in result
+        assert not result.startswith("Error")
 
     @pytest.mark.asyncio
     async def test_search_fields_multi_term_runs_in_parallel(self) -> None:
@@ -953,14 +968,29 @@ class TestFindFieldsSearch:
         assert "Server crashed" in result
 
     @pytest.mark.asyncio
-    async def test_deep_mode_rejects_list_search_text(self) -> None:
-        """Deep mode should not accept multi-term lists."""
-        result = await _find_fields(
-            ems_system_id=1, database_id="[db]",
-            mode="deep", search_text=["a", "b"],
-        )
-        assert "Error" in result
-        assert "deep mode does not support multi-term" in result
+    async def test_deep_mode_include_field_info_shows_discrete_values(self) -> None:
+        """include_field_info now works in deep mode (needed for FDW Flights)."""
+
+        async def fake_get(path: str, **kwargs: Any) -> Any:
+            if "/fields/" in path:
+                return {
+                    "id": "f-fleet", "name": "Fleet", "type": "discrete",
+                    "discreteValues": {"1": "QFA - A380-842"},
+                }
+            return {
+                "id": "[none]", "name": "Root",
+                "fields": [{"id": "f-fleet", "name": "Fleet", "type": "discrete"}],
+                "groups": [],
+            }
+
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(side_effect=fake_get)
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _find_fields(
+                ems_system_id=1, database_id="[db]",
+                mode="deep", search_text="fleet", include_field_info=True,
+            )
+        assert "QFA - A380-842" in result
 
     @pytest.mark.asyncio
     async def test_search_fields_include_field_info_fans_out(self) -> None:
@@ -1157,7 +1187,7 @@ class TestGetFieldInfo:
 
         with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
             result = await _get_field_info(
-                ems_system_id=1, database_id="[ems-core]", field_id=0
+                ems_system_id=1, database_id="[ems-core]", field_id=1
             )
 
         assert "Flight Date" in result
@@ -1239,7 +1269,29 @@ class TestSearchAnalytics:
                 ems_system_id=1, search_text="analytic", max_results=20
             )
 
-        assert "Found 20 analytic(s):" in result
+        assert "Showing 20 of 100 matching analytic(s)" in result
+
+    @pytest.mark.asyncio
+    async def test_search_analytics_ranks_name_matches_first(self) -> None:
+        """The canonical short name should outrank longer partial matches."""
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value=[
+            {"id": "a1", "name": "TCAS Advised Altitude Rate (effective) (ft/min)"},
+            {"id": "a2", "name": "Pressure Altitude Disagree Limit (High Altitude) (ft)"},
+            {"id": "a3", "name": "Pressure Altitude (ft)"},
+        ])
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _search_analytics(
+                ems_system_id=1, search_text="pressure altitude", max_results=1
+            )
+        assert "Pressure Altitude (ft)" in result
+        assert "Showing 1 of 3" in result
+
+    @pytest.mark.asyncio
+    async def test_search_analytics_rejects_empty_and_bad_max_results(self) -> None:
+        assert (await _search_analytics(ems_system_id=1, search_text=" ")).startswith("Error")
+        result = await _search_analytics(ems_system_id=1, search_text="x", max_results=0)
+        assert result.startswith("Error: max_results must be between 1")
 
     @pytest.mark.asyncio
     async def test_search_analytics_uses_cache(self) -> None:
@@ -1319,42 +1371,101 @@ class TestFindPhysicalParams:
         )
 
     @pytest.mark.asyncio
-    async def test_search_mode_uses_flight_scoped_endpoint(self) -> None:
-        """Passing search_text should hit the flight-scoped analytics search."""
+    async def test_search_mode_matches_raw_parameters_locally(self) -> None:
+        """Search matches the flight's raw-parameter list, so global constants
+        (which the API's text search mixes in) never appear."""
         mock_client = MagicMock()
-        mock_client.get = AsyncMock(
-            return_value=[
-                {"id": "phys-1", "name": "APU Bleed Valve", "type": "discrete"}
-            ]
-        )
+        mock_client.get = AsyncMock(return_value={
+            "id": "RG.RawParameters", "name": "Raw",
+            "analytics": [
+                {"id": "phys-1", "name": "APU Bleed Valve", "type": "discrete"},
+                {"id": "phys-2", "name": "Engine Bleed Pressure"},
+                {"id": "phys-3", "name": "Pitch Attitude"},
+            ],
+            "groups": [],
+        })
 
         with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
             result = await _find_physical_params(
-                ems_system_id=1, flight_id=4485012, search_text="bleed"
+                ems_system_id=1, flight_id=4485012, search_text="bleed", max_results=1,
             )
 
-        assert "APU Bleed Valve" in result
+        assert "Showing 1 of 2" in result
+        assert "Pitch Attitude" not in result
+        assert "not the name" in result and "flight_ids=[4485012]" in result
         mock_client.get.assert_called_once_with(
-            "/api/v2/ems-systems/1/flights/4485012/analytics",
-            params={"text": "bleed"},
+            "/api/v2/ems-systems/1/flights/4485012/analytic-groups",
+            params={"analyticGroupId": "RG.RawParameters"},
         )
 
     @pytest.mark.asyncio
     async def test_search_mode_with_group_id(self) -> None:
-        """Search mode should pass groupId when group_id is provided."""
+        """Search mode should search within group_id when provided."""
         mock_client = MagicMock()
-        mock_client.get = AsyncMock(return_value=[])
+        mock_client.get = AsyncMock(return_value={"analytics": [], "groups": []})
 
         with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
-            await _find_physical_params(
+            result = await _find_physical_params(
                 ems_system_id=1, flight_id=42, search_text="bleed",
                 group_id="RG.Engine",
             )
 
+        assert result.startswith("Error")
         mock_client.get.assert_called_once_with(
-            "/api/v2/ems-systems/1/flights/42/analytics",
-            params={"text": "bleed", "groupId": "RG.Engine"},
+            "/api/v2/ems-systems/1/flights/42/analytic-groups",
+            params={"analyticGroupId": "RG.Engine"},
         )
+
+    @pytest.mark.asyncio
+    async def test_search_no_match_is_not_an_error(self) -> None:
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value={
+            "analytics": [{"id": "p", "name": "Pitch Attitude"}], "groups": [],
+        })
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _find_physical_params(
+                ems_system_id=1, flight_id=42, search_text="%(",
+            )
+        assert result.startswith("No physical parameters")
+
+    @pytest.mark.asyncio
+    async def test_rejects_bad_max_results(self) -> None:
+        result = await _find_physical_params(ems_system_id=1, flight_id=42, max_results=-1)
+        assert result.startswith("Error: max_results must be between 1")
+
+    @pytest.mark.asyncio
+    async def test_unknown_group_is_reported_as_possibly_missing(self) -> None:
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value={"analytics": [], "groups": []})
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _find_physical_params(
+                ems_system_id=1, flight_id=42, group_id="nonexistent-group",
+            )
+        assert result.startswith("Error")
+        assert "may not exist" in result
+
+    @pytest.mark.asyncio
+    async def test_bad_flight_error_mentions_flight_may_not_exist(self) -> None:
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(side_effect=EMSAPIError(
+            "Your user account does not have access to data for flight 999.", 403,
+        ))
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _find_physical_params(ems_system_id=1, flight_id=999)
+        assert result.startswith("Error")
+        assert "may not exist" in result
+
+    @pytest.mark.asyncio
+    async def test_refs_record_flight_and_dedupe(self) -> None:
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value={
+            "analytics": [{"id": "phys-1", "name": "APU Bleed Valve"}], "groups": [],
+        })
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            first = await _find_physical_params(ems_system_id=1, flight_id=1)
+            second = await _find_physical_params(ems_system_id=1, flight_id=2)
+        assert "[1] APU Bleed Valve" in first and "[1] APU Bleed Valve" in second
+        assert _get_stored_result(1)["flight_ids"] == [1, 2]
 
     @pytest.mark.asyncio
     async def test_browse_stores_refs_for_query(self) -> None:
@@ -1373,7 +1484,7 @@ class TestFindPhysicalParams:
             await _find_physical_params(ems_system_id=1, flight_id=42)
 
         # The single parameter should have been stored under [0] as an analytic.
-        entry = _get_stored_result(0)
+        entry = _get_stored_result(1)
         assert entry is not None
         assert entry["type"] == "analytic"
         assert entry["id"] == "phys-99"
@@ -1415,7 +1526,7 @@ class TestFormatDeepSearchResults:
         assert "Fuel Burned [number (kg)]" in result
         assert "Path: Profiles > Efficiency" in result
         assert "ID:" not in result
-        assert "[0]" in result
+        assert "[1]" in result
         assert "reference numbers or field names" in result
 
     def test_single_result_show_ids(self) -> None:
@@ -2428,9 +2539,9 @@ class TestResultStore:
         r0 = _store_result("A", "id-a")
         r1 = _store_result("B", "id-b")
         r2 = _store_result("C", "id-c")
-        assert r0 == 0
-        assert r1 == 1
-        assert r2 == 2
+        assert r0 == 1
+        assert r1 == 2
+        assert r2 == 3
 
     def test_invalid_ref_returns_none(self) -> None:
         """Looking up a non-existent ref returns None."""
@@ -2465,8 +2576,8 @@ class TestResultStore:
         _format_field_search_results(fields1)
         _format_field_search_results(fields2)
         # Both should be retrievable
-        e0 = _get_stored_result(0)
-        e1 = _get_stored_result(1)
+        e0 = _get_stored_result(1)
+        e1 = _get_stored_result(2)
         assert e0 is not None and e0["name"] == "Alpha"
         assert e1 is not None and e1["name"] == "Beta"
 
@@ -2477,8 +2588,8 @@ class TestResultStore:
             {"id": "field-xyz", "name": "Altitude", "type": "number", "units": "ft"},
         ]
         result = _format_field_search_results(fields)
-        assert "[0]" in result
-        entry = _get_stored_result(0)
+        assert "[1]" in result
+        entry = _get_stored_result(1)
         assert entry is not None
         assert entry["id"] == "field-xyz"
         assert entry["name"] == "Altitude"
@@ -2490,8 +2601,8 @@ class TestResultStore:
             {"id": "H4sIAAAA...", "name": "Airspeed", "type": "number", "units": "knots"},
         ]
         result = _format_analytics_search_results(analytics)
-        assert "[0]" in result
-        entry = _get_stored_result(0)
+        assert "[1]" in result
+        entry = _get_stored_result(1)
         assert entry is not None
         assert entry["id"] == "H4sIAAAA..."
         assert entry["name"] == "Airspeed"
@@ -2508,8 +2619,8 @@ class TestResultStore:
             "path": "Profiles",
         }]
         result = _format_deep_search_results(results, "fuel")
-        assert "[0]" in result
-        entry = _get_stored_result(0)
+        assert "[1]" in result
+        entry = _get_stored_result(1)
         assert entry is not None
         assert entry["id"] == "field-123"
 
@@ -2530,10 +2641,10 @@ class TestGetResultId:
         _reset_result_store()
         _store_result("Flight Number", "[-hub-][field][flight-num]")
         _store_result("Duration", "[-hub-][field][duration]")
-        result = await _get_result_id(result_numbers=[0, 1])
-        assert "[0] Flight Number (field)" in result
+        result = await _get_result_id(result_numbers=[1, 2])
+        assert "[1] Flight Number (field)" in result
         assert "ID: [-hub-][field][flight-num]" in result
-        assert "[1] Duration (field)" in result
+        assert "[2] Duration (field)" in result
         assert "ID: [-hub-][field][duration]" in result
 
     @pytest.mark.asyncio
@@ -2541,8 +2652,8 @@ class TestGetResultId:
         """Should show (analytic) type label for analytic refs."""
         _reset_result_store()
         _store_result("Airspeed", "H4sIAAAA...", result_type="analytic")
-        result = await _get_result_id(result_numbers=[0])
-        assert "[0] Airspeed (analytic)" in result
+        result = await _get_result_id(result_numbers=[1])
+        assert "[1] Airspeed (analytic)" in result
 
     @pytest.mark.asyncio
     async def test_invalid_ref(self) -> None:
@@ -2557,8 +2668,8 @@ class TestGetResultId:
         """Should handle mix of valid and invalid refs."""
         _reset_result_store()
         _store_result("Good", "id-good")
-        result = await _get_result_id(result_numbers=[0, 42])
-        assert "[0] Good" in result
+        result = await _get_result_id(result_numbers=[1, 42])
+        assert "[1] Good" in result
         assert "ID: id-good" in result
         assert "Not found" in result
         assert "42" in result
@@ -2583,15 +2694,22 @@ class TestResolveFieldId:
     @pytest.mark.asyncio
     async def test_integer_ref_from_store(self) -> None:
         """Integer reference should look up in result store."""
-        _store_result("Flight Date", "[-hub-][field][date]")
-        result = await _resolve_field_id(0, ems_system_id=1, database_id="[db]")
+        ref = _store_result("Flight Date", "[-hub-][field][date]")
+        result = await _resolve_field_id(ref, ems_system_id=1, database_id="[db]")
         assert result == "[-hub-][field][date]"
 
     @pytest.mark.asyncio
     async def test_digit_string_ref_from_store(self) -> None:
         """Digit string should look up in result store."""
-        _store_result("Flight Date", "[-hub-][field][date]")
-        result = await _resolve_field_id("0", ems_system_id=1, database_id="[db]")
+        ref = _store_result("Flight Date", "[-hub-][field][date]")
+        result = await _resolve_field_id(str(ref), ems_system_id=1, database_id="[db]")
+        assert result == "[-hub-][field][date]"
+
+    @pytest.mark.asyncio
+    async def test_bracketed_ref_string_from_store(self) -> None:
+        """The "[N]" display form should resolve as a ref, not pass through as an ID."""
+        ref = _store_result("Flight Date", "[-hub-][field][date]")
+        result = await _resolve_field_id(f"[{ref}]", ems_system_id=1, database_id="[db]")
         assert result == "[-hub-][field][date]"
 
     @pytest.mark.asyncio
@@ -2738,17 +2856,46 @@ class TestResolveFieldId:
         assert result == "field-1"
 
     @pytest.mark.asyncio
-    async def test_name_single_result(self) -> None:
-        """Single API result should be used even without exact match."""
+    async def test_name_single_non_exact_result_is_not_used(self) -> None:
+        """A lone fuzzy hit must not be substituted silently; it is offered as a candidate."""
         mock_client = MagicMock()
         mock_client.get = AsyncMock(return_value=[
             {"id": "field-1", "name": "Takeoff Airport Name"},
         ])
         with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
-            result = await _resolve_field_id(
-                "Takeoff Airport", ems_system_id=1, database_id="[db]"
-            )
-        assert result == "field-1"
+            with pytest.raises(ValueError, match="does not exactly match") as exc_info:
+                await _resolve_field_id(
+                    "Takeoff Airport", ems_system_id=1, database_id="[db]"
+                )
+        message = str(exc_info.value)
+        ref = int(re.search(r"\[(\d+)\]", message).group(1))  # type: ignore[union-attr]
+        assert "Takeoff Airport Name" in message
+        # The candidate's [N] resolves to the real field.
+        assert await _resolve_field_id(ref, ems_system_id=1, database_id="[db]") == "field-1"
+
+    @pytest.mark.asyncio
+    async def test_path_only_match_is_not_substituted(self) -> None:
+        """Regression: 'Total Fuel Burned' must not resolve to 'Total Time Airborne'."""
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value=[
+            {"id": "p197-airborne", "name": "P197: Total Time Airborne (Hours)"},
+        ])
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            with pytest.raises(ValueError, match="Total Time Airborne"):
+                await _resolve_field_id(
+                    "Total Fuel Burned", ems_system_id=1, database_id="[db]"
+                )
+
+    @pytest.mark.asyncio
+    async def test_misses_are_cached(self) -> None:
+        """A failed name lookup is remembered so the expensive search is not repeated."""
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value=[{"id": "f1", "name": "Altitude (Baro)"}])
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            for _ in range(2):
+                with pytest.raises(ValueError):
+                    await _resolve_field_id("Altitude", ems_system_id=1, database_id="[db]")
+        assert mock_client.get.call_count == 1
 
     @pytest.mark.asyncio
     async def test_name_not_found(self) -> None:
@@ -2770,10 +2917,12 @@ class TestResolveFieldId:
             {"id": "f2", "name": "Altitude (GPS)"},
         ])
         with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
-            with pytest.raises(ValueError, match="Ambiguous"):
+            with pytest.raises(ValueError, match="Closest candidates") as exc_info:
                 await _resolve_field_id(
                     "Altitude", ems_system_id=1, database_id="[db]"
                 )
+        assert "Altitude (Baro)" in str(exc_info.value)
+        assert "Altitude (GPS)" in str(exc_info.value)
 
     @pytest.mark.asyncio
     async def test_name_cached(self) -> None:
@@ -2863,22 +3012,22 @@ class TestResolveFieldId:
     @pytest.mark.asyncio
     async def test_analytic_ref_rejected(self) -> None:
         """Analytic references should be rejected with helpful error."""
-        _store_result("Airspeed", "H4sIAAAA...", result_type="analytic")
+        ref = _store_result("Airspeed", "H4sIAAAA...", result_type="analytic")
         with pytest.raises(ValueError, match="analytic parameter"):
-            await _resolve_field_id(0, ems_system_id=1, database_id="[db]")
+            await _resolve_field_id(ref, ems_system_id=1, database_id="[db]")
 
     @pytest.mark.asyncio
     async def test_analytic_ref_error_mentions_query_flight_analytics(self) -> None:
         """Analytic ref rejection should mention query_flight_analytics."""
-        _store_result("Altitude (Baro)", "H4sIAAAA...", result_type="analytic")
+        ref = _store_result("Altitude (Baro)", "H4sIAAAA...", result_type="analytic")
         with pytest.raises(ValueError, match="query_flight_analytics"):
-            await _resolve_field_id(0, ems_system_id=1, database_id="[db]")
+            await _resolve_field_id(ref, ems_system_id=1, database_id="[db]")
 
     @pytest.mark.asyncio
     async def test_field_ref_still_works(self) -> None:
         """Field references (default type) should still resolve normally."""
-        _store_result("Flight Date", "[-hub-][field][date]")
-        result = await _resolve_field_id(0, ems_system_id=1, database_id="[db]")
+        ref = _store_result("Flight Date", "[-hub-][field][date]")
+        result = await _resolve_field_id(ref, ems_system_id=1, database_id="[db]")
         assert result == "[-hub-][field][date]"
 
     @pytest.mark.asyncio
@@ -3104,7 +3253,9 @@ class TestCompactAnalyticOutput:
         assert "[unknown" not in out
         assert "Name:" not in out
         assert "    Uid: SW2B211" in out
-        assert "2.5 BLEED ACTUATOR FEEDBACK SYS. 1 (%) [%]" in out
+        # Units already in the name are not repeated as a [%] label.
+        assert "2.5 BLEED ACTUATOR FEEDBACK SYS. 1 (%)\n" in out
+        assert "[%]" not in out
 
     def test_analytics_search_output_is_compact(self) -> None:
         analytics = [

@@ -126,7 +126,7 @@ Create `.gemini/settings.json` in the project directory:
 ### Discovery
 - `list_ems_systems` -- List available EMS systems (start here)
 - `list_databases` -- Navigate the database hierarchy
-- `find_fields` -- Find fields by keyword (`mode="search"`), browse the field group tree (`mode="browse"`), or BFS-traverse entity-type databases (`mode="deep"`); returns numbered `[N]` references usable directly in other tools
+- `find_fields` -- Find fields by keyword (`mode="search"`; runs as `mode="deep"` automatically on entity-type databases such as FDW Flights), browse the field group tree (`mode="browse"`), or BFS-traverse a database (`mode="deep"`); returns numbered `[N]` references usable directly in other tools. Field names elsewhere must match exactly -- near-misses return candidate `[N]` refs instead of being substituted
 - `get_field_info` -- Get field metadata and discrete value mappings
 - `search_analytics` -- Search for time-series analytics by name (altitude, airspeed, etc.)
 - `get_result_id` -- (Deprecated) Resolve `[N]` references to full opaque IDs; no longer needed in the standard workflow
