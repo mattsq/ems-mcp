@@ -348,7 +348,36 @@ class TestFindEventTypes:
             )
         assert "Error" in result
         assert "P999" in result
-        assert "P40" in result and "P796" in result
+        # No longer dumps every valid code (that was ~3k tokens on real systems).
+        assert "Valid codes from the catalog" not in result
+        assert "list_event_profiles" in result
+
+    @pytest.mark.asyncio
+    async def test_unknown_profile_name_suggests_close_matches_as_refs(self) -> None:
+        client = await self._setup({
+            "P40": [{"value": 1, "label": "Hard Landing"}],
+            "P796": [{"value": 1, "label": "Hard Landing (Generic)"}],
+        })
+        with patch("ems_mcp.tools.discovery.get_client", return_value=client):
+            result = await _find_event_types(
+                ems_system_id=1, query="hard landing", profiles=["P40: Event"],
+            )
+        # "P40: Event..." resolves by its code prefix rather than failing.
+        assert not result.startswith("Error"), result
+
+    @pytest.mark.asyncio
+    async def test_profiles_accept_numbered_refs(self) -> None:
+        client = await self._setup({
+            "P40": [{"value": 47, "label": "Hard Landing"}],
+        })
+        with patch("ems_mcp.tools.discovery.get_client", return_value=client):
+            listing = await _list_event_profiles(ems_system_id=1)
+            ref = listing.split("[")[1].split("]")[0]
+            result = await _find_event_types(
+                ems_system_id=1, query="hard landing", profiles=[f"[{ref}]"],
+            )
+        assert "Hard Landing" in result
+        assert "code=47" in result
 
     @pytest.mark.asyncio
     async def test_returns_matches_grouped_by_profile(self) -> None:
@@ -436,13 +465,17 @@ class TestFindEventTypes:
                 query="hard landing",
                 profiles=["P40"],
             )
-        # First match should get [0].
-        assert "[0]" in result
-        entry = _get_stored_result(0)
+        # [1] is the profile's database ref; the first event match gets [2].
+        assert 'database_id="[1]"' in result
+        assert _get_stored_result(1)["type"] == "event-profile"
+        assert "[2]" in result
+        entry = _get_stored_result(2)
         assert entry is not None
         assert entry["type"] == "event-value"
         assert entry["id"] == "47"
         assert "Hard Landing" in entry["name"]
+        # The event ref carries its Event Type field so query_database can expand it.
+        assert entry.get("event_type_field_id")
 
     @pytest.mark.asyncio
     async def test_repeat_call_uses_cached_event_type_field(self) -> None:
@@ -545,8 +578,7 @@ class TestListEventProfilesNameFilter:
                 ems_system_id=1, name_filter="landing", max_results=5,
             )
 
-        assert "Showing first 5" in result
-        assert "20" in result  # total match count surfaced
+        assert "Showing 5 of 20" in result  # total match count surfaced
         # Hint at how to narrow further.
         assert "name_filter" in result
 

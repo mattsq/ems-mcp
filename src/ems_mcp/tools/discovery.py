@@ -63,7 +63,8 @@ logger = logging.getLogger(__name__)
 # to retrieve the actual IDs for the specific results it needs.
 
 _result_store: dict[int, dict[str, Any]] = {}
-_next_ref: int = 0
+# References start at 1 so a ref is never falsy for callers that test it.
+_next_ref: int = 1
 _STORE_MAX_SIZE: int = 500
 
 # Default analytic group holding raw/physical FDR parameters for a flight.
@@ -108,12 +109,17 @@ def _store_result(
     ems_system_id: int | None = None,
     database_id: str | None = None,
     path: str | None = None,
+    flight_id: int | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> int:
     """Store a result and return its reference number.
 
     Entries accumulate across searches so the agent can reference results
-    from any prior search within the session. When the store exceeds
-    ``_STORE_MAX_SIZE``, the oldest entries are evicted.
+    from any prior search within the session. Storing the same result again
+    (same type, id, system and database) returns the existing reference
+    instead of minting a new one, so refs stay stable across repeated
+    searches. When the store exceeds ``_STORE_MAX_SIZE``, the least recently
+    stored entries are evicted.
 
     Args:
         name: Human-readable name of the result.
@@ -128,11 +134,34 @@ def _store_result(
             when the path is not known (search/browse mode). Used by
             ``suggest_query_filters`` for path-authoritative profile/event
             detection.
+        flight_id: Flight the result was discovered on (physical parameters
+            only). Accumulated into ``flight_ids`` so downstream tools can
+            warn when a flight-scoped ref is used on a different flight.
+        extra: Additional metadata merged into the entry (e.g. the Event
+            Type field ID for event-value refs).
 
     Returns:
         The reference number assigned to this result.
     """
     global _next_ref  # noqa: PLW0603
+
+    for existing_ref, entry in list(_result_store.items()):
+        if (
+            entry.get("type") == result_type
+            and entry.get("id") == result_id
+            and entry.get("ems_system_id") == ems_system_id
+            and entry.get("database_id") == database_id
+        ):
+            if path and not entry.get("path"):
+                entry["path"] = path
+            if flight_id is not None and flight_id not in entry["flight_ids"]:
+                entry["flight_ids"].append(flight_id)
+            if extra:
+                entry.update(extra)
+            # Refresh recency so frequently re-seen refs are not evicted.
+            del _result_store[existing_ref]
+            _result_store[existing_ref] = entry
+            return existing_ref
 
     ref = _next_ref
     _next_ref += 1
@@ -143,6 +172,8 @@ def _store_result(
         "ems_system_id": ems_system_id,
         "database_id": database_id,
         "path": path,
+        "flight_ids": [flight_id] if flight_id is not None else [],
+        **(extra or {}),
     }
 
     # Evict oldest entries when over capacity. dict preserves insertion
@@ -205,7 +236,34 @@ def _reset_result_store() -> None:
     """Reset the result store (for testing only)."""
     global _next_ref  # noqa: PLW0603
     _result_store.clear()
-    _next_ref = 0
+    _next_ref = 1
+
+
+def _parse_ref_number(value: Any) -> int | None:
+    """Return N for an [N] reference given as int, "N" or "[N]", else None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if (
+            len(stripped) >= 3
+            and stripped.startswith("[")
+            and stripped.endswith("]")
+            and stripped[1:-1].isdigit()
+        ):
+            return int(stripped[1:-1])
+        if stripped.isdigit():
+            return int(stripped)
+    return None
+
+
+def _validate_max_results(name: str, value: int, upper: int) -> str | None:
+    """Return an error message if ``value`` is outside ``1..upper``, else None."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1 or value > upper:
+        return f"Error: {name} must be between 1 and {upper} (got {value!r})."
+    return None
 
 
 def _lookup_stored_field(
@@ -355,9 +413,9 @@ async def _resolve_field_id(
     Raises:
         ValueError: If the reference cannot be resolved.
     """
-    # 1. Integer or digit string -> result store lookup
-    if isinstance(field_ref, int) or (isinstance(field_ref, str) and field_ref.strip().isdigit()):
-        ref_num = int(field_ref) if isinstance(field_ref, str) else field_ref
+    # 1. [N] reference (int, "N" or the "[N]" display form) -> result store
+    ref_num = _parse_ref_number(field_ref)
+    if ref_num is not None:
         entry = _get_stored_result(ref_num)
         if entry is not None:
             entry_type = entry.get("type")
@@ -422,6 +480,15 @@ async def _resolve_field_id(
     if cached is not None:
         return cached
 
+    # Misses are expensive on entity-type databases (a BFS of up to
+    # _MAX_GROUPS_HARD_CAP groups), so remember the candidate list too.
+    miss_key = make_cache_key("field_resolve_miss", ems_system_id, database_id, field_ref.lower())
+    cached_miss = await field_cache.get(miss_key)
+    if cached_miss is not None:
+        raise ValueError(
+            _format_field_not_found(field_ref, cached_miss, ems_system_id, database_id)
+        )
+
     client = get_client()
 
     # Entity-type databases don't support the field search endpoint (405);
@@ -443,13 +510,10 @@ async def _resolve_field_id(
         params = {"text": field_ref}
         search_results = await client.get(path, params=params)
 
-    if not search_results:
-        raise ValueError(
-            f"Field not found: '{field_ref}'. "
-            "Use find_fields to discover valid field names."
-        )
-
-    # Try exact name match (case-insensitive)
+    # Only an exact (case-insensitive) name match is resolved automatically.
+    # Anything looser -- even a single fuzzy hit -- risks silently querying a
+    # different field (e.g. "Total Fuel Burned" matching "Total Time
+    # Airborne" via its path), so it is offered back as a candidate instead.
     exact_matches = [
         f for f in search_results
         if f.get("name", "").lower() == field_ref.lower()
@@ -459,20 +523,89 @@ async def _resolve_field_id(
         await field_cache.set(cache_key, resolved_id)
         return resolved_id
 
-    # Single result total -> use it
-    if len(search_results) == 1:
-        resolved_id = search_results[0]["id"]
-        await field_cache.set(cache_key, resolved_id)
-        return resolved_id
-
-    # Multiple matches with no exact match -> ambiguous
-    match_names = [f.get("name", "?") for f in search_results[:5]]
+    if len(exact_matches) > 1:
+        candidates = exact_matches
+    else:
+        candidates = _rank_by_name(search_results, field_ref)[:5]
+    slim = [
+        {"name": c.get("name", "?"), "id": c.get("id", ""), "path": c.get("path")}
+        for c in candidates
+    ]
+    if not exact_matches:
+        await field_cache.set(miss_key, slim)
     raise ValueError(
-        f"Ambiguous field name: '{field_ref}'. "
-        f"Multiple matches found: {', '.join(match_names)}"
-        f"{'...' if len(search_results) > 5 else ''}. "
-        "Use a more specific name or use find_fields to find the exact name."
+        _format_field_not_found(
+            field_ref, slim, ems_system_id, database_id,
+            ambiguous_exact=len(exact_matches) > 1,
+        )
     )
+
+
+def _name_rank(name: str, query: str) -> tuple[int, int, int]:
+    """Sort key ranking how well ``name`` matches ``query`` (lower is better).
+
+    Tiers: exact name, name starts with query, every query token in the
+    name, some tokens in the name, none (path-only match). Ties go to the
+    shorter name, which is usually the canonical one ("Pressure Altitude
+    (ft)" before "Pressure Altitude Disagree Limit (High Altitude) (ft)").
+    """
+    name_l = name.lower()
+    query_l = query.strip().lower()
+    tokens = _tokenize_query(query_l)
+    hits = sum(1 for t in tokens if t in name_l)
+    if name_l == query_l:
+        tier = 0
+    elif name_l.startswith(query_l):
+        tier = 1
+    elif tokens and hits == len(tokens):
+        tier = 2
+    elif hits:
+        tier = 3
+    else:
+        tier = 4
+    return (tier, -hits, len(name_l))
+
+
+def _rank_by_name(items: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+    """Return ``items`` sorted best-first by how well their name matches ``query``."""
+    return sorted(items, key=lambda i: _name_rank(str(i.get("name", "")), query))
+
+
+def _format_field_not_found(
+    field_ref: str,
+    candidates: list[dict[str, Any]],
+    ems_system_id: int,
+    database_id: str,
+    ambiguous_exact: bool = False,
+) -> str:
+    """Build the error for a field name that did not resolve to one exact match.
+
+    Candidates are registered as [N] refs so the agent can confirm one
+    directly instead of re-running discovery.
+    """
+    if not candidates:
+        return (
+            f"Field not found: '{field_ref}'. No field with a similar name exists. "
+            "Use find_fields to discover valid field names."
+        )
+    if ambiguous_exact:
+        lead = f"Ambiguous field name: '{field_ref}' matches several fields exactly."
+    else:
+        lead = (
+            f"Field not found: '{field_ref}' does not exactly match any field name "
+            "(names must match exactly to be used automatically)."
+        )
+    lines = [lead, "Closest candidates (pass the [N] to use one):"]
+    for c in candidates:
+        ref = _store_result(
+            c["name"], c["id"],
+            ems_system_id=ems_system_id, database_id=database_id,
+            path=c.get("path"),
+        )
+        path = f"  (path: {c['path']})" if c.get("path") else ""
+        lines.append(f"  [{ref}] {c['name']}{path}")
+    lines.append("If none of these is right, use find_fields to search more broadly.")
+    return "\n".join(lines)
 
 
 async def _resolve_database_id(
@@ -502,6 +635,19 @@ async def _resolve_database_id(
         raise ValueError("database_id cannot be empty.")
 
     database_ref = database_ref.strip()
+
+    # 0. [N] reference to an event-profile database (from list_event_profiles
+    # / find_event_types).
+    ref_num = _parse_ref_number(database_ref)
+    if ref_num is not None:
+        entry = _get_stored_result(ref_num)
+        if entry is None or entry.get("type") != "event-profile":
+            raise ValueError(
+                f"Reference [{ref_num}] is not a known database reference. "
+                "Database [N] refs come from list_event_profiles / find_event_types; "
+                "otherwise pass the database name (e.g. \"FDW Flights\")."
+            )
+        return str(entry["id"])
 
     # 1. Bracket-encoded -> pass through
     if database_ref.startswith("["):
@@ -553,6 +699,34 @@ async def _resolve_database_id(
     resolved = name_map.get(database_ref.lower())
     if resolved is not None:
         return resolved
+
+    # Event-profile databases sit 3-4 levels deep (FDW > APM Events > ...),
+    # beyond the shallow name map. Fall back to the profile catalog, matching
+    # an exact database name or a profile code ("P972").
+    try:
+        catalog, _ = await _get_event_profile_catalog(ems_system_id)
+    except (EMSAPIError, EMSNotFoundError):
+        catalog = None
+    if catalog:
+        ref_lower = database_ref.lower()
+        by_name = [e for e in catalog if e["database_name"].lower() == ref_lower]
+        if len(by_name) == 1:
+            return str(by_name[0]["database_id"])
+        code = _normalize_profile_code(database_ref)
+        by_code = [e for e in catalog if code and e.get("code") == code]
+        if code and code.lower() == ref_lower and len(by_code) == 1:
+            return str(by_code[0]["database_id"])
+        if len(by_name) > 1 or (code and code.lower() == ref_lower and len(by_code) > 1):
+            dupes = by_name or by_code
+            refs = ", ".join(
+                f"[{_store_event_profile_ref(e, ems_system_id)}] "
+                f"{e['database_name']} (in {e.get('group_name') or '?'})"
+                for e in dupes[:10]
+            )
+            raise ValueError(
+                f"Database name '{database_ref}' matches {len(dupes)} event-profile "
+                f"databases: {refs}. Pass the [N] of the one you want."
+            )
 
     # Not found
     available = sorted(set(name_map.keys()))[:10]
@@ -900,6 +1074,9 @@ def _analytic_type_label(analytic: dict[str, Any]) -> str:
     if analytic_type == "unknown":
         analytic_type = None
     units = analytic.get("units")
+    # Names usually already end with the units, e.g. "... (ft/min)".
+    if units and str(analytic.get("name", "")).rstrip().endswith(f"({units})"):
+        units = None
     if analytic_type and units:
         return f" [{analytic_type} ({units})]"
     if analytic_type or units:
@@ -938,46 +1115,79 @@ def _compact_analytic_description(name: str, description: str | None) -> str | N
     return "; ".join(kept) or None
 
 
-def _format_analytics_search_results(
+def _format_analytic_entries(
     analytics: list[dict[str, Any]],
-    show_ids: bool = False,
-    ems_system_id: int | None = None,
-) -> str:
-    """Format analytics search results for display.
+    show_ids: bool,
+    ems_system_id: int | None,
+    flight_id: int | None = None,
+) -> list[str]:
+    """Render analytic rows, registering each as an [N] ref.
 
-    Args:
-        analytics: List of analytic dicts from the API.
-        show_ids: If True, show full IDs inline (backward compat).
-            If False (default), assign numbered refs and hide IDs.
-        ems_system_id: EMS system the search ran against.
+    With ``show_ids`` the full ID is printed under the row as well; refs are
+    always assigned so the two forms stay interchangeable.
     """
-    if not analytics:
-        return "No analytics found matching the search criteria."
-
-    lines = [f"Found {len(analytics)} analytic(s):"]
+    lines: list[str] = []
     for a in analytics:
         analytic_id = a.get("id", "?")
         analytic_name = a.get("name", "Unknown")
         type_str = _analytic_type_label(a)
         description = _compact_analytic_description(analytic_name, a.get("description"))
-
+        ref = _store_result(
+            analytic_name, analytic_id,
+            result_type="analytic", ems_system_id=ems_system_id,
+            flight_id=flight_id,
+        )
+        lines.append(f"\n  [{ref}] {analytic_name}{type_str}")
+        if description:
+            lines.append(f"    {description}")
         if show_ids:
-            lines.append(f"\n  {analytic_name}{type_str}")
-            if description:
-                lines.append(f"    {description}")
             lines.append(f"    ID: {analytic_id}")
-        else:
-            ref = _store_result(
-                analytic_name, analytic_id,
-                result_type="analytic", ems_system_id=ems_system_id,
-            )
-            lines.append(f"\n  [{ref}] {analytic_name}{type_str}")
-            if description:
-                lines.append(f"    {description}")
+    return lines
 
-    if not show_ids:
+
+def _format_analytics_search_results(
+    analytics: list[dict[str, Any]],
+    show_ids: bool = False,
+    ems_system_id: int | None = None,
+    total_available: int | None = None,
+    flight_id: int | None = None,
+) -> str:
+    """Format analytics search results for display.
+
+    Args:
+        analytics: List of analytic dicts to show (already sliced).
+        show_ids: If True, also show full IDs inline (they are long --
+            ~300 characters for physical parameters).
+        ems_system_id: EMS system the search ran against.
+        total_available: Matches before slicing; when larger than
+            ``len(analytics)`` the header says how many were hidden.
+        flight_id: Set for flight-scoped physical-parameter searches. Refs
+            record the flight, and the hint points at [N] refs because
+            physical-parameter names cannot be resolved globally by name.
+    """
+    if not analytics:
+        return "No analytics found matching the search criteria."
+
+    total = total_available if total_available is not None else len(analytics)
+    if total > len(analytics):
+        header = (
+            f"Showing {len(analytics)} of {total} matching analytic(s) "
+            "(raise max_results or refine search_text to see others):"
+        )
+    else:
+        header = f"Found {len(analytics)} analytic(s):"
+    lines = [header]
+    lines.extend(_format_analytic_entries(analytics, show_ids, ems_system_id, flight_id))
+
+    if flight_id is not None:
         lines.append(
-            "\nYou can pass analytic names directly to query_flight_analytics."
+            f"\nPass the [N] reference (not the name) to query_flight_analytics "
+            f"with flight_ids=[{flight_id}]; physical parameters are specific to "
+            "this flight's recorder frame."
+        )
+    else:
+        lines.append(
+            "\nPass the [N] reference or the exact name to query_flight_analytics."
         )
 
     return "\n".join(lines)
@@ -989,6 +1199,7 @@ def _format_physical_group(
     group_id: str,
     max_results: int = 50,
     show_ids: bool = False,
+    flight_id: int | None = None,
 ) -> str:
     """Format a flight-scoped analytic-group response (physical parameters).
 
@@ -1008,10 +1219,16 @@ def _format_physical_group(
     group_name = data.get("name") or group_id
 
     if not analytics and not subgroups:
+        hint = (
+            "Omit group_id to browse the default raw-parameter group "
+            f"('{_RAW_PARAMETERS_GROUP_ID}')."
+            if group_id != _RAW_PARAMETERS_GROUP_ID else
+            "Pass search_text to search by keyword."
+        )
         return (
-            f"Group '{group_name}' has no physical parameters or sub-groups "
-            "for this flight. Try a different group_id, or pass search_text "
-            "to search by keyword."
+            f"Error: group '{group_name}' returned no physical parameters or "
+            "sub-groups for this flight -- the group_id may not exist (EMS "
+            f"returns an empty group for unknown IDs). {hint}"
         )
 
     lines = [
@@ -1019,24 +1236,9 @@ def _format_physical_group(
         f"({len(analytics)} parameter(s), {len(subgroups)} sub-group(s))",
     ]
 
-    for a in analytics[:max_results]:
-        analytic_id = a.get("id", "?")
-        analytic_name = a.get("name", "Unknown")
-        type_str = _analytic_type_label(a)
-        description = _compact_analytic_description(analytic_name, a.get("description"))
-        if show_ids:
-            lines.append(f"\n  {analytic_name}{type_str}")
-            if description:
-                lines.append(f"    {description}")
-            lines.append(f"    ID: {analytic_id}")
-        else:
-            ref = _store_result(
-                analytic_name, analytic_id,
-                result_type="analytic", ems_system_id=ems_system_id,
-            )
-            lines.append(f"\n  [{ref}] {analytic_name}{type_str}")
-            if description:
-                lines.append(f"    {description}")
+    lines.extend(
+        _format_analytic_entries(analytics[:max_results], show_ids, ems_system_id, flight_id)
+    )
 
     if len(analytics) > max_results:
         lines.append(
@@ -1051,10 +1253,11 @@ def _format_physical_group(
             g_id = g.get("id", "?")
             lines.append(f"  {g_name}  (group_id: {g_id})")
 
-    if not show_ids and analytics:
+    if analytics:
+        flight_hint = f"flight_ids=[{flight_id}]" if flight_id is not None else "the same flight_id"
         lines.append(
-            "\nPass a [N] reference (with the same flight_id) to "
-            "query_flight_analytics to poll a parameter's values."
+            f"\nPass the [N] reference (not the name) to query_flight_analytics "
+            f"with {flight_hint} to poll a parameter's values."
         )
     return "\n".join(lines)
 
@@ -1116,8 +1319,13 @@ def _format_deep_search_results(
                     " then scope deep search to that subtree with group_id=N."
                     "\n  2. Simplify search_text to a single key term (e.g. 'rotation' instead"
                     " of 'rotation rate high')."
-                    "\n  3. Increase max_groups (up to 500) if you suspect the field is deep"
-                    " in a large subtree."
+                    + (
+                        "\n  3. Increase max_groups (up to 500) if you suspect the field is deep"
+                        " in a large subtree."
+                        if max_groups < _MAX_GROUPS_HARD_CAP else
+                        "\n  (max_groups is already at the 500 cap -- scope the search with"
+                        " group_id instead.)"
+                    )
                 )
         if clamp_note:
             msg += clamp_note
@@ -1156,6 +1364,10 @@ def _format_deep_search_results(
             )
             lines.append(f"\n  [{ref}] {field_name} [{type_str}]")
             lines.append(f"    Path: {path}")
+        if f.get("description"):
+            lines.append(f"    {f['description']}")
+        if f.get("discreteValues"):
+            lines.extend(_format_inline_discrete_values(f["discreteValues"]))
 
     if not show_ids and results:
         lines.append(
@@ -1166,8 +1378,10 @@ def _format_deep_search_results(
         stats = f"\n(Searched {groups_visited} group(s), budget: {max_groups})"
         if groups_visited >= max_groups:
             stats += (
-                "\nBudget exhausted -- more matches may exist. Increase max_groups or scope"
-                " the search with group_id=N (from a prior browse) to search a subtree."
+                "\nBudget exhausted -- more matches may exist. "
+                + ("Increase max_groups or scope" if max_groups < _MAX_GROUPS_HARD_CAP
+                   else "max_groups is at the 500 cap, so scope")
+                + " the search with group_id=N (from a prior browse) to search a subtree."
             )
         lines.append(stats)
     if clamp_note:
@@ -1533,6 +1747,24 @@ async def _do_search_fields(
     )
 
 
+def _clean_search_terms(search_terms: list[Any]) -> list[str]:
+    """Strip, drop empty/non-string, and case-insensitively dedupe terms."""
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for term in search_terms:
+        if not isinstance(term, str):
+            continue
+        stripped = term.strip()
+        if not stripped:
+            continue
+        key = stripped.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(stripped)
+    return cleaned
+
+
 async def _do_search_fields_multi(
     ems_system_id: int,
     database_id: str,
@@ -1572,20 +1804,7 @@ async def _do_search_fields_multi(
             "for BFS traversal, or mode='browse' to navigate field groups."
         )
 
-    cleaned: list[str] = []
-    seen: set[str] = set()
-    for term in search_terms:
-        if not isinstance(term, str):
-            continue
-        stripped = term.strip()
-        if not stripped:
-            continue
-        key = stripped.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        cleaned.append(stripped)
-
+    cleaned = _clean_search_terms(search_terms)
     if not cleaned:
         return "Error: search_text list contained no usable search terms."
 
@@ -1714,6 +1933,7 @@ async def _do_deep_search_fields(
     max_groups: int,
     show_ids: bool,
     root_group_id: str | int | None = None,
+    include_field_info: bool = False,
 ) -> str:
     """Deep mode: BFS traversal of field group hierarchy.
 
@@ -1728,6 +1948,8 @@ async def _do_deep_search_fields(
         root_group_id: Optional [N] reference or opaque group ID to scope
             BFS to a specific subtree. When set, the search starts from
             that group instead of the database root.
+        include_field_info: If True, fetch field metadata for each result so
+            descriptions and discrete-value mappings appear inline.
 
     Returns:
         Formatted deep search results.
@@ -1736,7 +1958,7 @@ async def _do_deep_search_fields(
         return "Error: search_text cannot be empty."
 
     max_depth = min(max(1, max_depth), 10)
-    max_results = min(max(1, max_results), 50)
+    max_results = min(max(1, max_results), 500)
     max_groups_requested = max_groups
     max_groups = min(max(1, max_groups), _MAX_GROUPS_HARD_CAP)
 
@@ -1764,6 +1986,13 @@ async def _do_deep_search_fields(
         # BFS stops collecting once max_results is hit; signal that to
         # the agent so it knows whether to raise the cap or pivot keywords.
         result_cap_hit = len(results) >= max_results
+        # BFS order follows the tree; put fields whose NAME matches first so
+        # path-only matches do not crowd out the obvious candidates.
+        results = _rank_by_name(results, search_text.strip())
+        if include_field_info:
+            results = await _enrich_with_field_info(
+                client, ems_system_id, database_id, results
+            )
         return _format_deep_search_results(
             results, search_text.strip(), groups_visited, max_groups,
             show_ids=show_ids,
@@ -1854,8 +2083,9 @@ async def find_fields(
 ) -> str:
     """Find fields in a database. Three modes available:
 
-    - search: Fast keyword search (default). Requires search_text.
-      Does NOT work on entity-type databases.
+    - search: Keyword search (default). Requires search_text. On
+      entity-type databases (including FDW Flights), which have no keyword
+      search endpoint, this automatically runs as deep mode.
     - browse: Navigate field group hierarchy. Use group_id to drill down.
     - deep: BFS traversal across all field groups. Requires search_text.
       Works on ALL databases including entity-type. Slower (multiple API calls).
@@ -1864,26 +2094,25 @@ async def find_fields(
       already known (e.g. after a browse).
 
     Results show numbered references [N] that can be used directly in
-    query_database, get_field_info, etc. Field names also work.
+    query_database, get_field_info, etc. Exact field names also work.
 
-    Pass a list to search_text to run multiple keyword searches in parallel
+    Pass a list to search_text to run several keyword searches in one call
     (e.g. ["fuel burn", "tail number", "takeoff airport"]) -- this collapses
-    N round-trips into one tool call. Each term is cached individually.
+    N round-trips into one tool call, in every mode that searches.
 
     Args:
         ems_system_id: EMS system ID.
         database_id: Database ID or name (e.g. "FDW Flights").
         mode: "search" (fast keyword), "browse" (navigate groups), or "deep" (BFS).
-        search_text: Search keyword, or a list of keywords for parallel
-            multi-term search. Required for search and deep modes.
-            Multi-term lists are only supported in search mode.
+        search_text: Search keyword, or a list of keywords for multi-term
+            search. Required for search and deep modes.
         group_id: Field group context. In browse mode, navigates into
             that group. In deep mode, scopes BFS to that subtree
             (skipping the rest of the database). Accepts an [N] reference
             number from a prior browse listing (e.g. 3 or "[3]") or a raw
             bracket-encoded group ID. Ignored in search mode. Omit to
             start from the database root.
-        max_results: Maximum results per term (search/deep modes, default: 50).
+        max_results: Maximum results per term (1-500, default: 50).
         max_depth: Maximum traversal depth (deep mode, default: 5, max: 10).
         max_groups: Maximum API calls (deep mode, default: 50, max: 500).
             When ``mode='deep'`` is combined with ``group_id`` and this
@@ -1893,40 +2122,44 @@ async def find_fields(
             Values above the cap are clamped; the search output discloses
             the clamp so the agent knows it was applied.
         show_ids: If True, show full IDs inline instead of numbered references.
-        include_field_info: If True (search mode only), fetch full field
-            metadata in parallel for every result so descriptions and
+        include_field_info: If True (search and deep modes), fetch full
+            field metadata for every result so descriptions and
             discrete-value mappings appear inline. Eliminates a follow-up
             get_field_info call per discrete field.
 
     Returns:
         Fields with names, types, and IDs (or numbered references).
     """
+    if err := _validate_max_results("max_results", max_results, 500):
+        return err
+
     # Resolve database name -> ID
     try:
         database_id = await _resolve_database_id(database_id, ems_system_id)
     except ValueError as e:
         return f"Error resolving database: {e}"
 
+    # Entity-type databases (FDW Flights included) have no field search
+    # endpoint. Rather than failing the most common first call, run the
+    # equivalent deep search and say so.
+    fallback_note = ""
+    if mode == "search" and _is_entity_type_database(database_id):
+        mode = "deep"
+        fallback_note = (
+            "(This is an entity-type database, which has no keyword search "
+            "endpoint, so mode='deep' was used instead.)\n"
+        )
+
     if mode == "browse":
         if include_field_info:
             return (
-                "Error: include_field_info is only supported in search mode. "
+                "Error: include_field_info is not supported in browse mode. "
                 "Use get_field_info on individual fields after browsing."
             )
         return await _do_browse_fields(ems_system_id, database_id, group_id)
     elif mode == "deep":
-        if include_field_info:
-            return (
-                "Error: include_field_info is only supported in search mode. "
-                "Use get_field_info on individual fields after deep search."
-            )
         if not search_text:
             return "Error: search_text is required for deep mode."
-        if isinstance(search_text, list):
-            return (
-                "Error: deep mode does not support multi-term search. "
-                "Pass a single string to search_text, or call again per term."
-            )
         # When the agent has scoped deep search to a subtree via group_id
         # but left max_groups at the documented default, raise the budget.
         # A narrowed subtree typically still has several deep layers and
@@ -1936,11 +2169,22 @@ async def find_fields(
         effective_max_groups = max_groups
         if group_id is not None and max_groups == _DEFAULT_MAX_GROUPS:
             effective_max_groups = _SCOPED_DEFAULT_MAX_GROUPS
-        return await _do_deep_search_fields(
-            ems_system_id, database_id, search_text,
-            max_results, max_depth, effective_max_groups, show_ids,
-            root_group_id=group_id,
-        )
+        terms = search_text if isinstance(search_text, list) else [search_text]
+        cleaned = _clean_search_terms(terms)
+        if not cleaned:
+            return "Error: search_text contained no usable search terms."
+        # Terms run sequentially: they share the field-group cache, so later
+        # terms mostly re-walk groups the first term already fetched.
+        blocks: list[str] = []
+        for term in cleaned:
+            block = await _do_deep_search_fields(
+                ems_system_id, database_id, term,
+                max_results, max_depth, effective_max_groups, show_ids,
+                root_group_id=group_id,
+                include_field_info=include_field_info,
+            )
+            blocks.append(block if len(cleaned) == 1 else f'Search: "{term}"\n{block}')
+        return fallback_note + "\n\n".join(blocks)
     else:  # mode == "search" (default)
         if not search_text:
             return "Error: search_text is required for search mode."
@@ -2024,6 +2268,8 @@ async def get_field_info(
 # (cheap catalog), then search inside the chosen profiles' Event Type enums.
 
 _APM_GROUP_NAME: str = "apm events"
+# Field groups visited per profile when looking for its Event Type field.
+_EVENT_TYPE_MAX_GROUPS: int = 40
 _APM_GROUP_BFS_DEPTH: int = 5
 _PROFILE_CODE_RE = re.compile(r"\bP\d+\b", re.IGNORECASE)
 
@@ -2132,7 +2378,9 @@ async def _collect_profile_databases(
             if not db_id or db_id in seen_db_ids:
                 continue
             seen_db_ids.add(db_id)
-            collected.append(db)
+            # Remember the containing folder: profile names repeat across
+            # folders (e.g. per fleet), and the folder is what tells them apart.
+            collected.append({**db, "_group_name": current.get("name") or ""})
 
         for child in current.get("groups", []):
             child_id = child.get("id")
@@ -2188,6 +2436,7 @@ async def _get_event_profile_catalog(
             "database_id": db_id,
             "database_name": db_name,
             "description": description,
+            "group_name": db.get("_group_name", ""),
         })
 
     # Stable order: profiles with a code first, sorted numerically by the
@@ -2205,6 +2454,40 @@ async def _get_event_profile_catalog(
 
     await database_cache.set(cache_key, catalog)
     return catalog, []
+
+
+def _store_event_profile_ref(entry: dict[str, Any], ems_system_id: int) -> int:
+    """Register a catalog entry as an [N] database reference.
+
+    Usable as ``database_id`` in query_database / find_fields and as an
+    entry in find_event_types(profiles=[...]) -- the only handle for
+    profiles whose name carries no P-code.
+    """
+    return _store_result(
+        entry["database_name"], str(entry["database_id"]),
+        result_type="event-profile", ems_system_id=ems_system_id,
+        extra={"code": entry.get("code"), "group_name": entry.get("group_name")},
+    )
+
+
+def _profile_label(entry: dict[str, Any], duplicate_names: set[str]) -> str:
+    """Display name for a catalog entry, adding the folder when names repeat."""
+    name = entry["database_name"]
+    if name.lower() in duplicate_names and entry.get("group_name"):
+        return f"{name} (in {entry['group_name']})"
+    return name
+
+
+def _duplicate_profile_names(catalog: list[dict[str, Any]]) -> set[str]:
+    """Lowercased database names that occur more than once in ``catalog``."""
+    seen: set[str] = set()
+    dupes: set[str] = set()
+    for e in catalog:
+        n = e["database_name"].lower()
+        if n in seen:
+            dupes.add(n)
+        seen.add(n)
+    return dupes
 
 
 def _catalog_entry_haystack(entry: dict[str, Any]) -> str:
@@ -2237,12 +2520,16 @@ def _auto_shortlist_profiles(
     query_terms: list[str],
     max_count: int,
 ) -> tuple[list[dict[str, Any]], bool]:
-    """Pick profiles whose name/description contains ANY query token.
+    """Pick profiles matching the query, preferring ALL tokens over ANY.
 
-    More permissive than ``_filter_catalog_by_name`` -- any-token (OR)
-    instead of AND -- because event-name tokens often only partially
-    overlap with profile descriptions (e.g. "tail strike" against a
-    profile named "Airframe Strike" still matches via "strike").
+    First tries AND-of-tokens (the same semantics as list_event_profiles'
+    name_filter). Only if nothing matches all tokens does it fall back to
+    any-token (OR) matching, because event-name tokens often only partially
+    overlap with profile descriptions (e.g. "tail strike" against a profile
+    named "Airframe Strike" still matches via "strike"). OR matches count
+    a token only against whole words (allowing a short plural/suffix), and
+    are ranked by how many tokens they contain, so a two-token hit like
+    "Tail Strike" outranks a one-token hit like "All Tails".
 
     Returns ``(shortlist, truncated)``. ``truncated`` is True if more
     profiles matched than ``max_count``; the caller is expected to
@@ -2260,11 +2547,22 @@ def _auto_shortlist_profiles(
     if not deduped_tokens:
         return [], False
 
-    matches: list[dict[str, Any]] = []
-    for entry in catalog:
-        haystack = _catalog_entry_haystack(entry)
-        if any(t in haystack for t in deduped_tokens):
-            matches.append(entry)
+    matches = [
+        entry for entry in catalog
+        if all(t in _catalog_entry_haystack(entry) for t in deduped_tokens)
+    ]
+    if not matches:
+        scored: list[tuple[int, int, dict[str, Any]]] = []
+        for i, entry in enumerate(catalog):
+            words = re.findall(r"\w+", _catalog_entry_haystack(entry))
+            score = sum(
+                1 for t in deduped_tokens
+                if any(w == t or (w.startswith(t) and len(w) - len(t) <= 2) for w in words)
+            )
+            if score:
+                scored.append((-score, i, entry))
+        scored.sort(key=lambda s: (s[0], s[1]))
+        matches = [entry for _, _, entry in scored]
 
     truncated = len(matches) > max_count
     return matches[:max_count], truncated
@@ -2276,8 +2574,14 @@ def _format_event_profile_catalog(
     total_unfiltered: int | None = None,
     max_display: int | None = None,
     name_filter: str | None = None,
+    ems_system_id: int | None = None,
 ) -> str:
     """Format the event-profile catalog for display.
+
+    Every entry gets an [N] database reference (usable as ``database_id`` in
+    query_database and in find_event_types(profiles=[...])), which is the
+    only handle for profiles without a P-code. Entries whose names repeat
+    show their containing folder.
 
     Args:
         catalog: The (possibly filtered, possibly truncated) entries to render.
@@ -2302,41 +2606,41 @@ def _format_event_profile_catalog(
             "The folder exists but is empty in this EMS deployment."
         )
 
-    if name_filter:
-        header = (
-            f"Found {len(catalog)} APM event profile(s) matching "
-            f"name_filter={name_filter!r}"
-        )
-        if total_unfiltered is not None and total_unfiltered > len(catalog):
-            header += f" (of {total_unfiltered} total)"
-        header += ":"
+    total = total_unfiltered if total_unfiltered is not None else len(catalog)
+    truncated = total > len(catalog)
+    what = (
+        f"APM event profile(s) matching name_filter={name_filter!r}"
+        if name_filter else "APM event profile(s)"
+    )
+    if truncated:
+        header = f"Showing {len(catalog)} of {total} {what}:"
     else:
-        header = f"Found {len(catalog)} APM event profile(s):"
+        header = f"Found {len(catalog)} {what}:"
 
     lines = [header]
-    code_width = max((len(e["code"] or "?") for e in catalog), default=4)
+    dupes = _duplicate_profile_names(catalog)
+    code_width = max((len(e["code"] or "-") for e in catalog), default=4)
     for entry in catalog:
-        code = entry["code"] or "?"
-        name = entry["database_name"]
+        code = entry["code"] or "-"
+        name = _profile_label(entry, dupes)
         desc = entry["description"]
-        if desc and desc.strip() and desc.strip() != name:
-            lines.append(f"  {code:<{code_width}}  {name} - {desc}")
+        ref_str = ""
+        if ems_system_id is not None:
+            ref_str = f"[{_store_event_profile_ref(entry, ems_system_id)}] "
+        if desc and desc.strip() and desc.strip() != entry["database_name"]:
+            lines.append(f"  {ref_str}{code:<{code_width}}  {name} - {desc}")
         else:
-            lines.append(f"  {code:<{code_width}}  {name}")
-    if (
-        max_display is not None
-        and total_unfiltered is not None
-        and total_unfiltered > len(catalog)
-        and len(catalog) >= max_display
-    ):
-        # Filter (or unfiltered list) had more matches than fit; warn.
+            lines.append(f"  {ref_str}{code:<{code_width}}  {name}")
+    if truncated:
         lines.append(
-            f"\n(Showing first {max_display} of {total_unfiltered} match(es). "
-            "Pass a narrower name_filter to refine, or raise max_results.)"
+            f"\n({total - len(catalog)} more not shown. Pass a narrower "
+            "name_filter to refine, or raise max_results.)"
         )
     lines.append(
         "\nNext: find_event_types(ems_system_id, query, profiles=[...]) "
-        "with one or more codes from this list. If you don't yet know "
+        "with codes (e.g. \"P40\") or [N] refs from this list -- [N] works "
+        "for every profile, including ones without a code. The same [N] can "
+        "be passed as database_id to query_database. If you don't yet know "
         "which profile, omit profiles= and find_event_types will "
         "auto-shortlist based on the query."
     )
@@ -2350,10 +2654,16 @@ async def _resolve_event_type_field_id(
 ) -> tuple[str | None, str]:
     """Resolve the opaque field ID for a profile's Event Type field.
 
-    Tries (in order) the literal name ``"Event Type"`` and the prefixed
-    name ``"{code}: Event Type"``. Resolution goes through
-    ``_resolve_field_id`` so result-store hits and entity-type BFS both
-    work.
+    One bounded walk of the profile database's field groups, taking the
+    first field named ``"Event Type"`` or ``"<anything>: Event Type"``
+    (e.g. ``"P40: Event Type"``). Groups whose name mentions "event" are
+    visited first, since that is where the field lives.
+
+    This replaces resolving each candidate name separately through
+    ``_resolve_field_id``: a candidate that does not exist (common for
+    profiles without a P-code) made that resolver walk up to
+    ``_MAX_GROUPS_HARD_CAP`` groups before giving up -- thousands of API
+    calls when find_event_types scanned ten profiles.
 
     Returns ``(field_id, name_used)`` on success, or ``(None,
     error_message)`` on failure.
@@ -2366,24 +2676,41 @@ async def _resolve_event_type_field_id(
         cached_id, cached_name = cached
         return cached_id, cached_name
 
-    candidate_names = [
-        f"{profile_code}: Event Type",
-        "Event Type",
-    ]
-    errors: list[str] = []
-    for candidate in candidate_names:
+    client = get_client()
+    # (priority, insertion order, group id); insertion order breaks ties.
+    heap: list[tuple[int, int, str | None]] = [(0, 0, None)]
+    counter = 1
+    visited = 0
+    while heap and visited < _EVENT_TYPE_MAX_GROUPS:
+        _, _, group_id = heapq.heappop(heap)
         try:
-            field_id = await _resolve_field_id(candidate, ems_system_id, database_id)
-        except (ValueError, EMSAPIError) as e:
-            errors.append(f"'{candidate}': {e}")
+            group = await _fetch_field_group(client, ems_system_id, database_id, group_id)
+        except (EMSAPIError, EMSNotFoundError) as e:
+            if group_id is None:
+                return None, (
+                    f"Could not read fields of profile {profile_code} "
+                    f"(database {database_id}): {e}"
+                )
             continue
-        await field_cache.set(cache_key, [field_id, candidate])
-        return field_id, candidate
+        finally:
+            visited += 1
+        for field in group.get("fields", []):
+            name = str(field.get("name", ""))
+            lowered = name.strip().lower()
+            if lowered == "event type" or lowered.endswith(": event type"):
+                await field_cache.set(cache_key, [field["id"], name])
+                return field["id"], name
+        for sub in group.get("groups", []):
+            if sub.get("id"):
+                priority = 0 if "event" in str(sub.get("name", "")).lower() else 1
+                heapq.heappush(heap, (priority, counter, sub["id"]))
+                counter += 1
 
     return None, (
         f"Could not locate an 'Event Type' field in profile {profile_code} "
-        f"(database {database_id}). Tried: {', '.join(candidate_names)}. "
-        f"Errors: {' | '.join(errors)}"
+        f"(database {database_id}) within {visited} field group(s). This "
+        "database may not be an event profile; try another from "
+        "list_event_profiles."
     )
 
 
@@ -2434,6 +2761,81 @@ def _match_event_label(
     return True
 
 
+def _lookup_profile_entry(
+    raw: Any,
+    catalog: list[dict[str, Any]],
+    by_code: dict[str, dict[str, Any]],
+    by_db_id: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Resolve a profiles=[...] item to a catalog entry.
+
+    Accepts a profile code ("P40", case-insensitive), an [N] ref from
+    list_event_profiles / find_event_types, a raw database ID, or an exact
+    (case-insensitive) database name that is unique in the catalog.
+    """
+    ref_num = _parse_ref_number(raw)
+    if ref_num is not None:
+        entry = _get_stored_result(ref_num)
+        if entry is not None and entry.get("type") == "event-profile":
+            return by_db_id.get(str(entry["id"]))
+        return None
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    text = raw.strip()
+    if text in by_db_id:
+        return by_db_id[text]
+    code = _normalize_profile_code(text)
+    if code and code.lower() == text.lower() and code in by_code:
+        return by_code[code]
+    named = [e for e in catalog if e["database_name"].lower() == text.lower()]
+    if len(named) == 1:
+        return named[0]
+    # A "P40: ..." style string whose code is known still resolves by code.
+    if code and code in by_code and text.lower().startswith(code.lower()):
+        return by_code[code]
+    return None
+
+
+def _format_unknown_profiles(
+    unknown: list[str],
+    catalog: list[dict[str, Any]],
+    ems_system_id: int,
+) -> str:
+    """Error for unrecognised profiles=[...] items, listing close matches only."""
+    import difflib
+
+    dupes = _duplicate_profile_names(catalog)
+    names = [e["database_name"] for e in catalog]
+    suggestions: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in unknown:
+        close = difflib.get_close_matches(item, names, n=10, cutoff=0.5)
+        candidates = [e for e in catalog if e["database_name"] in close]
+        if not candidates:
+            candidates = _filter_catalog_by_name(catalog, item)
+        for e in candidates:
+            key = str(e["database_id"])
+            if key not in seen and len(suggestions) < 20:
+                seen.add(key)
+                suggestions.append(e)
+    lines = [
+        f"Error: unknown profile(s): {', '.join(unknown)}. profiles=[...] "
+        "accepts P-codes (e.g. \"P40\"), [N] refs from list_event_profiles, "
+        "or an exact unique database name."
+    ]
+    if suggestions:
+        lines.append("Closest profiles (pass the [N]):")
+        for e in suggestions:
+            ref = _store_event_profile_ref(e, ems_system_id)
+            code = f"{e['code']}  " if e.get("code") else ""
+            lines.append(f"  [{ref}] {code}{_profile_label(e, dupes)}")
+    lines.append(
+        f"Or call list_event_profiles(ems_system_id={ems_system_id}, "
+        "name_filter=\"...\") to browse."
+    )
+    return "\n".join(lines)
+
+
 @mcp.tool
 async def list_event_profiles(
     ems_system_id: int,
@@ -2463,9 +2865,11 @@ async def list_event_profiles(
             how to narrow further.
 
     Returns:
-        One line per profile with code, name, and description, plus a
-        pointer to find_event_types.
+        One line per profile with an [N] ref, code, name, and description,
+        plus a pointer to find_event_types.
     """
+    if err := _validate_max_results("max_results", max_results, 1000):
+        return err
     try:
         catalog, root_group_names = await _get_event_profile_catalog(ems_system_id)
     except EMSNotFoundError:
@@ -2496,13 +2900,13 @@ async def list_event_profiles(
     if filter_clean:
         displayed = _filter_catalog_by_name(catalog, filter_clean)
     matched_total = len(displayed)
-    if max_results > 0 and matched_total > max_results:
+    if matched_total > max_results:
         displayed = displayed[:max_results]
 
     # When the filter zero-matched, surface the unfiltered catalog size so
     # the agent knows the directory exists and just nothing matched. When
-    # the filter did match, surface the match count for the "showing first
-    # N of M" truncation note.
+    # the filter did match, surface the match count for the "showing N of
+    # M" truncation note.
     if filter_clean:
         report_total = matched_total if matched_total > 0 else total_unfiltered
     else:
@@ -2513,6 +2917,7 @@ async def list_event_profiles(
         total_unfiltered=report_total,
         max_display=max_results,
         name_filter=filter_clean,
+        ems_system_id=ems_system_id,
     )
 
 
@@ -2535,8 +2940,9 @@ async def find_event_types(
 
     If you don't yet know which profile to scan, you may OMIT
     ``profiles``: the tool then auto-shortlists profiles whose name or
-    description contains any token from ``query`` (capped at
-    ``max_auto_profiles``). When the auto-shortlist is empty or too
+    description contains every token of ``query`` (falling back to the
+    best partial matches when none contain all of them), capped at
+    ``max_auto_profiles``. When the auto-shortlist is empty or too
     broad, the tool errors with a clear next step instead of scanning
     blindly.
 
@@ -2551,17 +2957,18 @@ async def find_event_types(
             with AND-of-tokens against the event label; multi-term lists
             behave as a conjunction across terms (all must hit). Stop
             words (a, an, the, of, ...) are dropped.
-        profiles: Optional list of profile codes (e.g. ["P40", "P796"]).
-            Codes are case-insensitive. Each must appear in the catalog.
+        profiles: Optional list of profiles: P-codes (e.g. ["P40", "P796"],
+            case-insensitive), [N] refs from list_event_profiles (needed for
+            profiles without a code), or exact unique database names.
             Omit to let the tool auto-shortlist by query match -- useful
             on EMS deployments with thousands of profiles where listing
             the full catalog is impractical.
         max_results_per_profile: Cap on matches reported per profile
-            (default: 20).
+            (1-500, default: 20).
         max_auto_profiles: Cap on auto-shortlist size when ``profiles``
-            is omitted (default: 10). If more profiles match the query,
-            the tool errors with the top candidates listed and asks for
-            an explicit ``profiles=[...]`` selection.
+            is omitted (1-50, default: 10). If more profiles match the
+            query, the tool errors with the top candidates (as [N] refs)
+            and asks for an explicit ``profiles=[...]`` selection.
 
     Returns:
         One line per matching event grouped by profile, plus a
@@ -2592,38 +2999,39 @@ async def find_event_types(
             "Call list_event_profiles to confirm the catalog is empty."
         )
 
+    if err := _validate_max_results("max_results_per_profile", max_results_per_profile, 500):
+        return err
+    if err := _validate_max_results("max_auto_profiles", max_auto_profiles, 50):
+        return err
+
     by_code: dict[str, dict[str, Any]] = {
         entry["code"]: entry for entry in catalog if entry.get("code")
     }
-    valid_codes = sorted(
-        by_code.keys(),
-        key=lambda c: (
-            int(re.findall(r"\d+", c)[0]) if re.findall(r"\d+", c) else 0, c,
-        ),
-    )
+    by_db_id: dict[str, dict[str, Any]] = {
+        str(entry["database_id"]): entry for entry in catalog
+    }
+    dupes = _duplicate_profile_names(catalog)
+
+    def _profile_key(entry: dict[str, Any]) -> str:
+        return entry.get("code") or _profile_label(entry, dupes)
 
     auto_selected: bool = False
     if profiles:
         requested: list[tuple[str, dict[str, Any]]] = []
         unknown: list[str] = []
-        seen_codes: set[str] = set()
+        seen_ids: set[str] = set()
         for raw in profiles:
-            code = _normalize_profile_code(raw if isinstance(raw, str) else None)
-            if not code or code not in by_code:
+            entry = _lookup_profile_entry(raw, catalog, by_code, by_db_id)
+            if entry is None:
                 unknown.append(str(raw))
                 continue
-            if code in seen_codes:
+            if str(entry["database_id"]) in seen_ids:
                 continue
-            seen_codes.add(code)
-            requested.append((code, by_code[code]))
+            seen_ids.add(str(entry["database_id"]))
+            requested.append((_profile_key(entry), entry))
 
         if unknown:
-            return (
-                f"Error: unknown profile code(s): {', '.join(unknown)}. "
-                f"Valid codes from the catalog: {', '.join(valid_codes)}. "
-                f"Call list_event_profiles(ems_system_id={ems_system_id}) "
-                "to refresh."
-            )
+            return _format_unknown_profiles(unknown, catalog, ems_system_id)
     else:
         # Auto-shortlist: pick profiles whose name/description mentions
         # any query token. Bounded by max_auto_profiles to prevent the
@@ -2642,19 +3050,19 @@ async def find_event_types(
                 "explicit profiles=[...]."
             )
         if truncated:
-            preview = ", ".join(
-                (e.get("code") or e.get("database_name") or "?")
+            preview = "\n".join(
+                f"  [{_store_event_profile_ref(e, ems_system_id)}] "
+                f"{str(e['code']) + '  ' if e.get('code') else ''}"
+                f"{_profile_label(e, dupes)}"
                 for e in shortlist
             )
             return (
                 f"Error: query {query_list!r} matched too many profiles "
-                f"(>{max_auto_profiles}). Top candidates: {preview}. "
-                "Either pass an explicit profiles=[...] list, raise "
+                f"(>{max_auto_profiles}). Top candidates:\n{preview}\n"
+                "Pass the codes or [N] refs you want as profiles=[...], raise "
                 "max_auto_profiles, or narrow the query."
             )
-        requested = [
-            (entry["code"], entry) for entry in shortlist if entry.get("code")
-        ]
+        requested = [(_profile_key(entry), entry) for entry in shortlist]
         auto_selected = True
 
     # Per-profile scan. Errors on a single profile are reported inline so
@@ -2696,7 +3104,16 @@ async def find_event_types(
         if not matches:
             continue
 
-        block_lines = [f"[{code}] {entry['database_name']}"]
+        db_ref = _store_event_profile_ref(entry, ems_system_id)
+        code_prefix = (
+            f"{entry['code']}: "
+            if entry.get("code") and not entry["database_name"].startswith(entry["code"])
+            else ""
+        )
+        block_lines = [
+            f"{code_prefix}{_profile_label(entry, dupes)}  "
+            f"(query with database_id=\"[{db_ref}]\")"
+        ]
         label_width = max(len(label) for _, label in matches)
         for value, label in matches:
             ref = _store_result(
@@ -2705,6 +3122,7 @@ async def find_event_types(
                 result_type="event-value",
                 ems_system_id=ems_system_id,
                 database_id=db_id,
+                extra={"event_type_field_id": field_id},
             )
             block_lines.append(
                 f"  [{ref}] {label:<{label_width}}  code={value}"
@@ -2751,8 +3169,11 @@ async def find_event_types(
         )
     lines = [header, ""] + output_blocks + [""]
     lines.append(
-        "Next: filter Event Type == <label> (or use the [N] reference) "
-        "in query_database against the matching profile's Events database."
+        "Next: query_database(database_id=\"[db ref shown above]\", ...) with "
+        "filters=[{\"field_id\": \"[N]\", \"operator\": \"equal\"}] where [N] is an "
+        "event ref above -- it expands to that profile's Event Type == code. "
+        "For several events of the same profile use {\"field_id\": \"[N1]\", "
+        "\"operator\": \"in\", \"value\": [\"[N1]\", \"[N2]\"]}."
     )
     if profile_errors:
         lines.append("")
@@ -2772,48 +3193,108 @@ async def search_analytics(
 ) -> str:
     """Search for time-series analytics by name (altitude, airspeed, etc.).
 
-    You can pass analytic names directly to query_flight_analytics -- raw IDs
-    are not needed. Use this tool to discover available analytic names.
+    Results are ranked by how well the name matches (exact, then prefix,
+    then all words) and get [N] references. Pass the [N] or the exact name
+    to query_flight_analytics -- raw IDs are not needed. Covers global
+    computed analytics only; raw recorder parameters need
+    find_physical_params.
 
     Args:
         ems_system_id: EMS system ID.
-        search_text: Keyword to search for in analytic names.
+        search_text: Keyword to search for in analytic names (non-empty).
         group_id: Optional analytic group ID to narrow search.
-        max_results: Maximum results (default: 50).
-        show_ids: If True, show full IDs inline.
+        max_results: Maximum results (1-500, default: 50).
+        show_ids: If True, also show full IDs inline.
 
     Returns:
         Matching analytics with names, types, units, and descriptions.
     """
+    if not search_text or not search_text.strip():
+        return "Error: search_text cannot be empty. Pass a keyword such as 'airspeed'."
+    if err := _validate_max_results("max_results", max_results, 500):
+        return err
+    search_text = search_text.strip()
+
     client = get_client()
 
     cache_key = make_cache_key(
         "analytics_search", ems_system_id, search_text.lower(), group_id or "all"
     )
-    cached = await field_cache.get(cache_key)
-    if cached is not None:
-        logger.debug("Using cached analytics search: %s", cache_key)
-        return _format_analytics_search_results(
-            cached[:max_results], show_ids=show_ids,
-            ems_system_id=ems_system_id,
-        )
-
-    try:
-        path = f"/api/v2/ems-systems/{ems_system_id}/analytics"
-        params: dict[str, str] = {"text": search_text}
-        if group_id:
-            params["groupId"] = group_id
-
-        analytics = await client.get(path, params=params)
+    analytics = await field_cache.get(cache_key)
+    if analytics is None:
+        try:
+            path = f"/api/v2/ems-systems/{ems_system_id}/analytics"
+            params: dict[str, str] = {"text": search_text}
+            if group_id:
+                params["groupId"] = group_id
+            analytics = await client.get(path, params=params)
+        except EMSNotFoundError:
+            return (
+                f"Error: EMS system {ems_system_id} not found. "
+                "Use list_ems_systems to find valid system IDs."
+            )
+        except EMSAPIError as e:
+            return f"Error searching analytics: {e.message}"
         await field_cache.set(cache_key, analytics)
-        return _format_analytics_search_results(
-            analytics[:max_results], show_ids=show_ids,
-            ems_system_id=ems_system_id,
-        )
-    except EMSNotFoundError:
-        return f"Error: EMS system {ems_system_id} not found. Use list_ems_systems to find valid system IDs."
-    except EMSAPIError as e:
-        return f"Error searching analytics: {e.message}"
+    else:
+        logger.debug("Using cached analytics search: %s", cache_key)
+
+    # The API returns matches in no useful order, so a generic term like
+    # "altitude" buries "Pressure Altitude (ft)" behind TCAS limits and
+    # constants. Rank by how well the name itself matches.
+    ranked = _rank_by_name(analytics, search_text)
+    return _format_analytics_search_results(
+        ranked[:max_results], show_ids=show_ids,
+        ems_system_id=ems_system_id, total_available=len(ranked),
+    )
+
+
+def _flight_error(flight_id: int, ems_system_id: int, message: str, action: str) -> str:
+    """Error text for a flight-scoped API failure.
+
+    EMS reports an unknown flight ID as a permissions problem ("does not have
+    access to data for flight N") or a generic 400, so the likely real cause
+    is spelt out.
+    """
+    return (
+        f"Error {action} for flight {flight_id}: {message} -- the flight ID may "
+        f"not exist in EMS system {ems_system_id}. Get flight record IDs from "
+        "query_database on 'FDW Flights' (field 'Flight Record')."
+    )
+
+
+async def _fetch_physical_group(
+    client: Any, ems_system_id: int, flight_id: int, group_id: str,
+) -> dict[str, Any]:
+    """Fetch (with caching) a flight-scoped analytic group."""
+    cache_key = make_cache_key("phys_group", ems_system_id, flight_id, group_id)
+    cached: dict[str, Any] | None = await field_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    data: dict[str, Any] = await client.get(
+        f"/api/v2/ems-systems/{ems_system_id}/flights/{flight_id}/analytic-groups",
+        params={"analyticGroupId": group_id},
+    )
+    await field_cache.set(cache_key, data)
+    return data
+
+
+async def _collect_physical_params(
+    client: Any, ems_system_id: int, flight_id: int, group_id: str, max_groups: int = 50,
+) -> list[dict[str, Any]]:
+    """Every analytic under ``group_id`` (BFS through sub-groups, bounded)."""
+    collected: list[dict[str, Any]] = []
+    queue = [group_id]
+    seen: set[str] = set()
+    while queue and len(seen) < max_groups:
+        gid = queue.pop(0)
+        if gid in seen:
+            continue
+        seen.add(gid)
+        data = await _fetch_physical_group(client, ems_system_id, flight_id, gid)
+        collected.extend(data.get("analytics") or [])
+        queue.extend(g["id"] for g in data.get("groups") or [] if g.get("id"))
+    return collected
 
 
 @mcp.tool
@@ -2835,91 +3316,77 @@ async def find_physical_params(
     same parameter may be present on one flight and absent on another.
 
     Two modes:
-      * Keyword search (pass search_text): finds parameters whose name matches,
-        scoped to this flight's frame. e.g. search_text="bleed".
+      * Keyword search (pass search_text): finds raw parameters whose name
+        contains every word of search_text, e.g. search_text="bleed".
       * Browse (omit search_text): lists the raw-parameter group's contents,
         including sub-groups you can drill into by passing their id as group_id.
 
-    Results are assigned [N] references that you pass directly to
-    query_flight_analytics (with the same flight_id) to poll their values.
+    Results are assigned [N] references. Pass the [N] (NOT the name -- names
+    of physical parameters do not resolve globally) to query_flight_analytics
+    with the same flight_id. A ref found on one flight may not exist on a
+    flight of a different fleet/frame; re-run this tool for that flight.
 
     Args:
         ems_system_id: EMS system ID.
         flight_id: Flight record ID (from query_database). Physical parameters
             are specific to this flight's frame configuration.
-        search_text: Optional keyword to match against parameter names. When
+        search_text: Optional keyword(s) matched against parameter names. When
             omitted, the tool browses the raw-parameter group instead.
-        group_id: Optional analytic group ID. In browse mode, defaults to the
-            raw parameters group ("RG.RawParameters"); pass a sub-group id from
-            a previous browse to drill in. In search mode, narrows the search.
-        max_results: Maximum results to return (default: 50).
-        show_ids: If True, show full IDs inline instead of [N] references.
+        group_id: Optional analytic group ID. Defaults to the raw parameters
+            group ("RG.RawParameters"); pass a sub-group id from a previous
+            browse to drill in (browse) or to narrow the search (search).
+        max_results: Maximum results to return (1-1000, default: 50).
+        show_ids: If True, also show full IDs inline. They are ~300
+            characters each, so leave this off unless you need raw IDs.
 
     Returns:
         Matching physical parameters (and sub-groups when browsing), with [N]
         references usable in query_flight_analytics.
     """
+    if err := _validate_max_results("max_results", max_results, 1000):
+        return err
     client = get_client()
+    gid = group_id or _RAW_PARAMETERS_GROUP_ID
 
-    if search_text:
-        # Flight-scoped analytics search: returns analytics (including physical
-        # parameters) available in this flight's context, filtered server-side
-        # by name.
-        path = (
-            f"/api/v2/ems-systems/{ems_system_id}/flights/{flight_id}/analytics"
-        )
-        params: dict[str, str] = {"text": search_text}
-        if group_id:
-            params["groupId"] = group_id
-
-        cache_key = make_cache_key(
-            "phys_search", ems_system_id, flight_id, search_text.lower(),
-            group_id or "all",
-        )
-        cached = await field_cache.get(cache_key)
-        if cached is not None:
-            logger.debug("Using cached physical-param search: %s", cache_key)
-            return _format_analytics_search_results(
-                cached[:max_results], show_ids=show_ids,
-                ems_system_id=ems_system_id,
-            )
-
+    if search_text is not None and search_text.strip():
+        text = search_text.strip()
+        # The flight-scoped /analytics?text= search mixes in global constants
+        # ("ISA Lapse Rate", "False", ...), ignores groupId and caps at 200,
+        # so match locally against the flight's raw-parameter list instead.
         try:
-            analytics = await client.get(path, params=params)
-        except EMSNotFoundError:
-            return (
-                f"Error: flight {flight_id} not found in EMS system "
-                f"{ems_system_id}. Use query_database to find valid flight "
-                "record IDs."
-            )
+            params = await _collect_physical_params(client, ems_system_id, flight_id, gid)
         except EMSAPIError as e:
-            return f"Error searching physical parameters: {e.message}"
-
-        await field_cache.set(cache_key, analytics)
+            return _flight_error(flight_id, ems_system_id, e.message, "searching physical parameters")
+        if not params:
+            return (
+                f"Error: flight {flight_id} returned no physical parameters under "
+                f"group '{gid}'. The flight ID or group_id may be wrong; get flight "
+                "IDs from query_database, and omit group_id to use the default "
+                f"'{_RAW_PARAMETERS_GROUP_ID}'."
+            )
+        matches = [p for p in params if _field_matches_query(str(p.get("name", "")), "", text)]
+        if not matches:
+            return (
+                f"No physical parameters on flight {flight_id} have names matching "
+                f"{text!r} (searched {len(params)} raw parameters). Try a shorter "
+                "or different keyword, or omit search_text to browse."
+            )
+        ranked = _rank_by_name(matches, text)
         return _format_analytics_search_results(
-            analytics[:max_results], show_ids=show_ids,
-            ems_system_id=ems_system_id,
+            ranked[:max_results], show_ids=show_ids,
+            ems_system_id=ems_system_id, total_available=len(ranked),
+            flight_id=flight_id,
         )
 
     # Browse mode: list the raw-parameter group's analytics and sub-groups.
-    gid = group_id or _RAW_PARAMETERS_GROUP_ID
-    path = (
-        f"/api/v2/ems-systems/{ems_system_id}/flights/{flight_id}/analytic-groups"
-    )
     try:
-        data = await client.get(path, params={"analyticGroupId": gid})
-    except EMSNotFoundError:
-        return (
-            f"Error: flight {flight_id} or group '{gid}' not found in EMS "
-            f"system {ems_system_id}. Use query_database to find valid flight "
-            "record IDs."
-        )
+        data = await _fetch_physical_group(client, ems_system_id, flight_id, gid)
     except EMSAPIError as e:
-        return f"Error browsing physical parameters: {e.message}"
+        return _flight_error(flight_id, ems_system_id, e.message, "browsing physical parameters")
 
     return _format_physical_group(
         data, ems_system_id=ems_system_id, group_id=gid,
-        max_results=max_results, show_ids=show_ids,
+        max_results=max_results, show_ids=show_ids, flight_id=flight_id,
     )
 
 

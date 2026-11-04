@@ -382,8 +382,10 @@ class TestFormatAnalyticsResults:
             },
         }]
         result = _format_analytics_results(results, max_rows_per_flight=200)
-        assert "300 more rows" in result
-        assert "500 total" in result
+        # Says which part of the window is shown and how to get the rest.
+        assert "Showing 200 of 500 samples" in result
+        assert "offsets 0.0-199.0 s of 0.0-499.0 s" in result
+        assert "sample_rate" in result
 
     def test_empty_data(self) -> None:
         """Flight with no data (empty offsets)."""
@@ -598,6 +600,8 @@ class TestQueryFlightAnalytics:
                 ems_system_id=1,
                 flight_ids=[12345],
                 analytics=["[-hub-][a1]", "[-hub-][a2]"],
+                start_offset=0.0,
+                end_offset=10.0,
             )
 
         # Default output_format is now 'csv'
@@ -622,6 +626,8 @@ class TestQueryFlightAnalytics:
                 ems_system_id=1,
                 flight_ids=[100, 200],
                 analytics=["[-hub-][alt]"],
+                start_offset=0.0,
+                end_offset=10.0,
             )
 
         # Default output_format is now 'csv'
@@ -629,6 +635,48 @@ class TestQueryFlightAnalytics:
         assert "200" in result
         assert "500.0" in result
         assert mock_client.post.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_whole_flight_request_honours_sample_rate(self) -> None:
+        """Without offsets, the flight span is probed (size=2) and the real
+        query is sized from it, so sample_rate is not ignored."""
+        calls: list[dict[str, Any]] = []
+
+        async def fake_post(path: str, json: Any = None, **kwargs: Any) -> Any:
+            calls.append(json)
+            if json.get("size") == 2:
+                return {"offsets": [0.0, 5000.0], "results": []}
+            n = json["size"]
+            return {
+                "offsets": [i * 5000.0 / max(n - 1, 1) for i in range(n)],
+                "results": [{"analyticId": "[-hub-][alt]", "values": [1.0] * n}],
+            }
+
+        mock_client = MagicMock()
+        mock_client.post = AsyncMock(side_effect=fake_post)
+        with patch("ems_mcp.tools.query.get_client", return_value=mock_client):
+            result = await _query_flight_analytics(
+                ems_system_id=1, flight_ids=[100], analytics=["[-hub-][alt]"],
+                sample_rate=0.01,
+            )
+        assert calls[0]["size"] == 2
+        assert calls[1]["size"] == 50  # 5000 s * 0.01 Hz
+        assert "(50 row(s))" in result
+
+    @pytest.mark.asyncio
+    async def test_whole_flight_rate_cap_is_disclosed(self) -> None:
+        async def fake_post(path: str, json: Any = None, **kwargs: Any) -> Any:
+            if json.get("size") == 2:
+                return {"offsets": [0.0, 10000.0], "results": []}
+            return {"offsets": [0.0], "results": [{"analyticId": "x", "values": [1.0]}]}
+
+        mock_client = MagicMock()
+        mock_client.post = AsyncMock(side_effect=fake_post)
+        with patch("ems_mcp.tools.query.get_client", return_value=mock_client):
+            result = await _query_flight_analytics(
+                ems_system_id=1, flight_ids=[100], analytics=["[-hub-][alt]"],
+            )
+        assert "capped at 5000" in result
 
     @pytest.mark.asyncio
     async def test_too_many_flights(self) -> None:
@@ -694,6 +742,8 @@ class TestQueryFlightAnalytics:
                 ems_system_id=1,
                 flight_ids=[100, 200],
                 analytics=["[-hub-][alt]"],
+                start_offset=0.0,
+                end_offset=10.0,
             )
 
         # Default output_format is now 'csv'
@@ -719,7 +769,8 @@ class TestQueryFlightAnalytics:
                 analytics=["[-hub-][alt]"],
             )
 
-        assert "All 2 flight(s) failed" in result
+        # Starts with "Error" so the server flags it as isError.
+        assert result.startswith("Error: all 2 flight(s) failed")
 
     @pytest.mark.asyncio
     async def test_time_range_validation(self) -> None:
@@ -894,15 +945,35 @@ class TestResolveAnalytics:
         assert result == [("Airspeed", "id-1")]
 
     @pytest.mark.asyncio
-    async def test_name_single_result(self) -> None:
-        """Single search result should be used even without exact name match."""
+    async def test_name_single_non_exact_result_is_not_used(self) -> None:
+        """A lone fuzzy hit is offered, not silently substituted."""
         mock_client = MagicMock()
         mock_client.get = AsyncMock(return_value=[
             {"id": "id-1", "name": "Baro-Corrected Altitude"},
         ])
         with patch("ems_mcp.tools.query.get_client", return_value=mock_client):
-            result = await _resolve_analytics(["Altitude"], ems_system_id=1)
-        assert result == [("Baro-Corrected Altitude", "id-1")]
+            with pytest.raises(ValueError, match="Baro-Corrected Altitude"):
+                await _resolve_analytics(["Altitude"], ems_system_id=1)
+
+    @pytest.mark.asyncio
+    async def test_name_resolves_from_stored_physical_param(self) -> None:
+        """A physical-parameter name seen via find_physical_params resolves by
+        name even though the global analytics search does not know it."""
+        from ems_mcp.tools.discovery import _reset_result_store, _store_result
+
+        _reset_result_store()
+        _store_result(
+            "2.5 BLEED ACTUATOR FEEDBACK SYS. 1 (%)", "H4sIAphys",
+            result_type="analytic", ems_system_id=1, flight_id=4599591,
+        )
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value=[])
+        with patch("ems_mcp.tools.query.get_client", return_value=mock_client):
+            result = await _resolve_analytics(
+                ["2.5 bleed actuator feedback sys. 1 (%)"], ems_system_id=1,
+            )
+        assert result == [("2.5 BLEED ACTUATOR FEEDBACK SYS. 1 (%)", "H4sIAphys")]
+        mock_client.get.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_name_not_found(self) -> None:
@@ -922,8 +993,9 @@ class TestResolveAnalytics:
             {"id": "id-2", "name": "Altitude (GPS)"},
         ])
         with patch("ems_mcp.tools.query.get_client", return_value=mock_client):
-            with pytest.raises(ValueError, match="Ambiguous"):
+            with pytest.raises(ValueError, match="not an exact match") as exc_info:
                 await _resolve_analytics(["Altitude"], ems_system_id=1)
+        assert "Altitude (Baro)" in str(exc_info.value)
 
     @pytest.mark.asyncio
     async def test_name_cached(self) -> None:
@@ -1018,7 +1090,7 @@ class TestResolveAnalytics:
         )
         mock_client = MagicMock()
         with patch("ems_mcp.tools.query.get_client", return_value=mock_client):
-            with pytest.raises(ValueError, match="not a known analytic"):
+            with pytest.raises(ValueError, match="is a field, not an analytic"):
                 await _resolve_analytics([f"[{ref}]"], ems_system_id=1)
 
 
@@ -1466,7 +1538,7 @@ class TestResolveDiscreteFilterValue:
             ],
         })
         with patch("ems_mcp.tools.query.get_client", return_value=mock_client):
-            with pytest.raises(ValueError, match="not found"):
+            with pytest.raises(ValueError, match="not an exact label of field 'Status'"):
                 await _resolve_discrete_filter_value(
                     "Unknown", "f1", ems_system_id=1, database_id="db",
                 )
@@ -1609,7 +1681,7 @@ class TestQueryDatabaseDiscreteResolution:
             )
 
         assert "Error resolving filter value" in result
-        assert "not found" in result.lower()
+        assert "not an exact label" in result
 
 
 class TestGetFieldMetadata:
@@ -2009,7 +2081,7 @@ class TestQueryDatabaseFieldResolution:
             result = await _query_database(
                 ems_system_id=1,
                 database_id="[db]",
-                fields=[{"field_id": 0}],
+                fields=[{"field_id": 1}],
             )
 
         assert "2024-01-15" in result
@@ -2094,7 +2166,7 @@ class TestQueryDatabaseFieldResolution:
         result = await _query_database(
             ems_system_id=1,
             database_id="[db]",
-            fields=[{"field_id": 0}],
+            fields=[{"field_id": 1}],
         )
         assert "Error resolving field" in result
         assert "analytic parameter" in result
@@ -2120,7 +2192,7 @@ class TestQueryDatabaseFieldResolution:
         result = await _query_database(
             ems_system_id=1,
             database_id="[db]",
-            fields=[{"field_id": 0}],
+            fields=[{"field_id": 1}],
         )
         assert "Error resolving field" in result
         assert "field group" in result
@@ -2147,7 +2219,7 @@ class TestQueryDatabaseFieldResolution:
         result = await _query_database(
             ems_system_id=1,
             database_id="[db-B]",
-            fields=[{"field_id": 0}],
+            fields=[{"field_id": 1}],
         )
         assert "Error resolving field" in result
         assert "different database" in result

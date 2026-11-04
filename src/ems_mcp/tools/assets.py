@@ -134,8 +134,16 @@ async def get_assets(
                 "Valid types: fleets, aircraft, airports, flight_phases."
             )
 
-    except EMSNotFoundError:
-        return f"Error: EMS system {ems_system_id} not found."
+    except EMSNotFoundError as e:
+        if asset_type == "aircraft" and fleet_id is not None:
+            return (
+                f"Error: fleet {fleet_id} not found ({e.message}). Use "
+                "get_assets(asset_type='fleets') to list valid fleet IDs."
+            )
+        return (
+            f"Error: EMS system {ems_system_id} not found. "
+            "Use list_ems_systems to find valid system IDs."
+        )
     except EMSAPIError as e:
         return f"Error getting {asset_type}: {e.message}"
 
