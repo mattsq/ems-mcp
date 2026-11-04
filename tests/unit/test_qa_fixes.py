@@ -98,6 +98,38 @@ class TestEventRefsInQueryDatabase:
         assert [a["value"] for a in f["args"][1:]] == [47, 48]
 
     @pytest.mark.asyncio
+    async def test_bare_numeric_string_value_is_not_treated_as_ref(self) -> None:
+        """PR review P1: Flight Number == "1" must stay "1" even when ref [1] is an event."""
+        ref = self._store_event()
+        assert ref == 1
+        client = _query_client()
+        # String values look up field metadata (for discrete labels); not discrete here.
+        client.get = AsyncMock(return_value={"id": "[-hub-][flight-number]", "type": "string"})
+        await _run_query(
+            client, database_id=PROFILE_DB, fields=[{"field_id": "[-hub-][rec]"}],
+            filters=[{"field_id": "[-hub-][flight-number]", "operator": "equal", "value": "1"}],
+            apply_best_practice_filters=False,
+        )
+        assert _sent_filter(client)["args"][1]["value"] == "1"
+
+    @pytest.mark.asyncio
+    async def test_event_ref_value_from_other_profile_is_rejected(self) -> None:
+        """PR review P2: a code from profile A must not be sent to profile B."""
+        other = _store_result(
+            "Event Type = Tail Strike", "23", result_type="event-value",
+            ems_system_id=1, database_id="[ems-core][entity-type][other-events]",
+            extra={"event_type_field_id": "[-hub-][other-event-type]"},
+        )
+        mine = self._store_event()
+        result = await _run_query(
+            _query_client(), database_id=PROFILE_DB, fields=[{"field_id": "[-hub-][rec]"}],
+            filters=[{"field_id": f"[{mine}]", "operator": "in",
+                      "value": [f"[{mine}]", f"[{other}]"]}],
+            apply_best_practice_filters=False,
+        )
+        assert result.startswith("Error") and "different profile database" in result
+
+    @pytest.mark.asyncio
     async def test_event_ref_from_other_database_is_rejected(self) -> None:
         ref = self._store_event()
         result = await _run_query(
@@ -261,6 +293,32 @@ class TestEventProfiles:
         """H4."""
         result = await _list_event_profiles(ems_system_id=1, max_results=-1)
         assert result.startswith("Error: max_results must be between 1")
+
+
+class TestResultStoreCapacity:
+    """PR review P2: a maximal listing must not evict refs it is returning."""
+
+    def test_thousand_row_listing_keeps_every_ref(self) -> None:
+        from ems_mcp.tools.discovery import _get_stored_result
+
+        refs = [_store_result(f"P{i}", f"[db-{i}]", result_type="event-profile",
+                              ems_system_id=1) for i in range(1000)]
+        assert all(_get_stored_result(r) is not None for r in refs)
+
+    def test_evicted_result_gets_fresh_ref_when_seen_again(self) -> None:
+        import ems_mcp.tools.discovery as disc
+
+        old_max = disc._STORE_MAX_SIZE
+        try:
+            disc._STORE_MAX_SIZE = 2
+            first = _store_result("A", "id-a")
+            _store_result("B", "id-b")
+            _store_result("C", "id-c")  # evicts A
+            assert disc._get_stored_result(first) is None
+            again = _store_result("A", "id-a")
+            assert again != first and disc._get_stored_result(again)["id"] == "id-a"
+        finally:
+            disc._STORE_MAX_SIZE = old_max
 
 
 class TestEventTypeFieldLookup:

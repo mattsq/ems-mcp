@@ -63,9 +63,14 @@ logger = logging.getLogger(__name__)
 # to retrieve the actual IDs for the specific results it needs.
 
 _result_store: dict[int, dict[str, Any]] = {}
+# (type, id, ems_system_id, database_id) -> ref, so re-storing a known result
+# is an O(1) lookup rather than a scan of the whole store.
+_result_index: dict[tuple[Any, ...], int] = {}
 # References start at 1 so a ref is never falsy for callers that test it.
 _next_ref: int = 1
-_STORE_MAX_SIZE: int = 500
+# Kept well above the largest single listing a tool can emit (1000 rows), so
+# a response never evicts references it is about to return.
+_STORE_MAX_SIZE: int = 5000
 
 # Default analytic group holding raw/physical FDR parameters for a flight.
 # Proven entry point for the flight-scoped analytic-groups endpoint (matches
@@ -145,26 +150,24 @@ def _store_result(
     """
     global _next_ref  # noqa: PLW0603
 
-    for existing_ref, entry in list(_result_store.items()):
-        if (
-            entry.get("type") == result_type
-            and entry.get("id") == result_id
-            and entry.get("ems_system_id") == ems_system_id
-            and entry.get("database_id") == database_id
-        ):
-            if path and not entry.get("path"):
-                entry["path"] = path
-            if flight_id is not None and flight_id not in entry["flight_ids"]:
-                entry["flight_ids"].append(flight_id)
-            if extra:
-                entry.update(extra)
-            # Refresh recency so frequently re-seen refs are not evicted.
-            del _result_store[existing_ref]
-            _result_store[existing_ref] = entry
-            return existing_ref
+    key = (result_type, result_id, ems_system_id, database_id)
+    existing_ref = _result_index.get(key)
+    if existing_ref is not None and existing_ref in _result_store:
+        entry = _result_store[existing_ref]
+        if path and not entry.get("path"):
+            entry["path"] = path
+        if flight_id is not None and flight_id not in entry["flight_ids"]:
+            entry["flight_ids"].append(flight_id)
+        if extra:
+            entry.update(extra)
+        # Refresh recency so frequently re-seen refs are not evicted.
+        del _result_store[existing_ref]
+        _result_store[existing_ref] = entry
+        return existing_ref
 
     ref = _next_ref
     _next_ref += 1
+    _result_index[key] = ref
     _result_store[ref] = {
         "name": name,
         "id": result_id,
@@ -181,7 +184,10 @@ def _store_result(
     # even if ``_next_ref`` is reset (e.g. by the test helper) and reused.
     while len(_result_store) > _STORE_MAX_SIZE:
         oldest_key = next(iter(_result_store))
-        del _result_store[oldest_key]
+        old = _result_store.pop(oldest_key)
+        old_key = (old.get("type"), old.get("id"), old.get("ems_system_id"), old.get("database_id"))
+        if _result_index.get(old_key) == oldest_key:
+            del _result_index[old_key]
 
     return ref
 
@@ -236,6 +242,7 @@ def _reset_result_store() -> None:
     """Reset the result store (for testing only)."""
     global _next_ref  # noqa: PLW0603
     _result_store.clear()
+    _result_index.clear()
     _next_ref = 1
 
 

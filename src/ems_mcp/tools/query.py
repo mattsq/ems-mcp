@@ -1073,6 +1073,10 @@ def _describe_filter(f: Any) -> str:
     return f"{f.get('field_id')} {symbol} {f.get('value')}"
 
 
+# The "[N]" display form of a reference (as opposed to a bare number).
+_BRACKETED_REF = re.compile(r"^\s*\[\d+\]\s*$")
+
+
 def _event_value_entry(ref: Any) -> dict[str, Any] | None:
     """Stored entry for an event-value [N] ref from find_event_types, else None."""
     ref_num = _parse_ref_number(ref)
@@ -1101,8 +1105,9 @@ def _normalize_filters(
     """Validate and normalise filters before field resolution.
 
     * Event-value [N] refs (from find_event_types) expand: as ``field_id``
-      they become the profile's Event Type field, and as values they become
-      the event's numeric code.
+      they become the profile's Event Type field, and as values -- only in
+      the explicit "[N]" string form -- they become the event's numeric
+      code. Value refs must come from the database being queried.
     * ``in`` with a scalar value is wrapped into a one-item list.
     * Non-ISO dates are rejected, because EMS would read 02/11/2026 as
       11 Feb rather than 2 Nov.
@@ -1139,8 +1144,29 @@ def _normalize_filters(
             value = [value]
 
         def _convert(v: Any) -> Any:
-            entry = _event_value_entry(v) if isinstance(v, str) else None
+            # Only the explicit "[N]" form counts as an event ref in a value:
+            # a bare "1" is an ordinary literal (e.g. Flight Number == "1")
+            # and must never be swapped for whatever ref [1] happens to be.
+            is_bracketed = isinstance(v, str) and _BRACKETED_REF.match(v) is not None
+            entry = _event_value_entry(v) if is_bracketed else None
             if entry is not None:
+                # A code is only meaningful within its own profile's Event Type
+                # field; the same number can be a different event elsewhere.
+                if entry.get("ems_system_id") != ems_system_id or (
+                    entry.get("database_id") != database_id
+                ):
+                    raise ValueError(
+                        f"event reference {v} ('{entry['name']}') belongs to a "
+                        "different profile database. Use event refs from the "
+                        "profile you are querying (see find_event_types)."
+                    )
+                if field_entry is not None and (
+                    entry.get("event_type_field_id") != field_entry.get("event_type_field_id")
+                ):
+                    raise ValueError(
+                        f"event reference {v} ('{entry['name']}') is for a different "
+                        f"Event Type field than {f.get('field_id')}."
+                    )
                 return _event_code(entry)
             if isinstance(v, str) and _NON_ISO_DATE.match(v):
                 raise ValueError(
