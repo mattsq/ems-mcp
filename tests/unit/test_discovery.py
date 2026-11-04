@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from ems_mcp.api.client import EMSNotFoundError
 from ems_mcp.tools.discovery import (
     _do_browse_fields,
     _do_search_fields,
@@ -25,6 +26,7 @@ from ems_mcp.tools.discovery import (
     _resolve_field_id,
     _store_result,
     find_fields,
+    find_physical_params,
     get_field_info,
     get_result_id,
     list_databases,
@@ -38,6 +40,7 @@ _list_databases = list_databases.fn
 _find_fields = find_fields.fn
 _get_field_info = get_field_info.fn
 _search_analytics = search_analytics.fn
+_find_physical_params = find_physical_params.fn
 _get_result_id = get_result_id.fn
 
 
@@ -1251,6 +1254,141 @@ class TestSearchAnalytics:
             await _search_analytics(ems_system_id=1, search_text="test")
 
         assert mock_client.get.call_count == 1
+
+
+class TestFindPhysicalParams:
+    """Tests for find_physical_params tool."""
+
+    @pytest.fixture(autouse=True)
+    async def clear_cache(self) -> None:
+        """Clear field cache and result store before each test."""
+        from ems_mcp.cache import field_cache
+        await field_cache.clear()
+        _reset_result_store()
+
+    @pytest.mark.asyncio
+    async def test_browse_defaults_to_raw_parameters_group(self) -> None:
+        """Browse mode should hit the flight-scoped analytic-groups endpoint
+        with the raw-parameters group by default and list parameters."""
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(
+            return_value={
+                "id": "RG.RawParameters",
+                "name": "Raw Parameters",
+                "analytics": [
+                    {
+                        "id": "phys-1",
+                        "name": "APU Bleed Air Valve",
+                        "type": "discrete",
+                        "description": "Raw FDR bleed valve",
+                    }
+                ],
+                "groups": [
+                    {"id": "RG.Engine", "name": "Engine Parameters"}
+                ],
+            }
+        )
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _find_physical_params(ems_system_id=1, flight_id=4485012)
+
+        assert "APU Bleed Air Valve" in result
+        assert "Engine Parameters" in result
+        assert "group_id: RG.Engine" in result
+        mock_client.get.assert_called_once_with(
+            "/api/v2/ems-systems/1/flights/4485012/analytic-groups",
+            params={"analyticGroupId": "RG.RawParameters"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_browse_with_explicit_group_id(self) -> None:
+        """A passed group_id should be used to drill into a sub-group."""
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(
+            return_value={"id": "RG.Engine", "name": "Engine", "analytics": [], "groups": []}
+        )
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            await _find_physical_params(
+                ems_system_id=1, flight_id=4485012, group_id="RG.Engine"
+            )
+
+        mock_client.get.assert_called_once_with(
+            "/api/v2/ems-systems/1/flights/4485012/analytic-groups",
+            params={"analyticGroupId": "RG.Engine"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_search_mode_uses_flight_scoped_endpoint(self) -> None:
+        """Passing search_text should hit the flight-scoped analytics search."""
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(
+            return_value=[
+                {"id": "phys-1", "name": "APU Bleed Valve", "type": "discrete"}
+            ]
+        )
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _find_physical_params(
+                ems_system_id=1, flight_id=4485012, search_text="bleed"
+            )
+
+        assert "APU Bleed Valve" in result
+        mock_client.get.assert_called_once_with(
+            "/api/v2/ems-systems/1/flights/4485012/analytics",
+            params={"text": "bleed"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_search_mode_with_group_id(self) -> None:
+        """Search mode should pass groupId when group_id is provided."""
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value=[])
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            await _find_physical_params(
+                ems_system_id=1, flight_id=42, search_text="bleed",
+                group_id="RG.Engine",
+            )
+
+        mock_client.get.assert_called_once_with(
+            "/api/v2/ems-systems/1/flights/42/analytics",
+            params={"text": "bleed", "groupId": "RG.Engine"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_browse_stores_refs_for_query(self) -> None:
+        """Browsed parameters should be stored as analytic refs so they can be
+        carried into query_flight_analytics by [N]."""
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(
+            return_value={
+                "name": "Raw Parameters",
+                "analytics": [{"id": "phys-99", "name": "Bleed Valve", "type": "discrete"}],
+                "groups": [],
+            }
+        )
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            await _find_physical_params(ems_system_id=1, flight_id=42)
+
+        # The single parameter should have been stored under [0] as an analytic.
+        entry = _get_stored_result(0)
+        assert entry is not None
+        assert entry["type"] == "analytic"
+        assert entry["id"] == "phys-99"
+
+    @pytest.mark.asyncio
+    async def test_flight_not_found(self) -> None:
+        """A 404 should produce a helpful error pointing to query_database."""
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(side_effect=EMSNotFoundError("Not found"))
+
+        with patch("ems_mcp.tools.discovery.get_client", return_value=mock_client):
+            result = await _find_physical_params(ems_system_id=1, flight_id=999)
+
+        assert "not found" in result.lower()
+        assert "query_database" in result
 
 
 class TestFormatDeepSearchResults:
@@ -2910,3 +3048,73 @@ class TestResolveDatabaseId:
         """Empty database reference should raise ValueError."""
         with pytest.raises(ValueError, match="cannot be empty"):
             await _resolve_database_id("", ems_system_id=1)
+
+
+class TestCompactAnalyticOutput:
+    """Physical-parameter output should not waste tokens on redundant text."""
+
+    def test_type_label_omits_unknown(self) -> None:
+        from ems_mcp.tools.discovery import _analytic_type_label
+
+        assert _analytic_type_label({}) == ""
+        assert _analytic_type_label({"type": "unknown"}) == ""
+        assert _analytic_type_label({"units": "%"}) == " [%]"
+        assert _analytic_type_label({"type": "number", "units": "ft"}) == " [number (ft)]"
+        assert _analytic_type_label({"type": "number"}) == " [number]"
+
+    def test_description_drops_name_repeat(self) -> None:
+        from ems_mcp.tools.discovery import _compact_analytic_description
+
+        name = "10TH BLEED SOLENOID CLOSE - SYS 1"
+        desc = "Uid: SW2B211\nName: 10TH BLEED SOLENOID CLOSE - SYS 1."
+        assert _compact_analytic_description(name, desc) == "Uid: SW2B211"
+
+    def test_description_only_name_becomes_none(self) -> None:
+        from ems_mcp.tools.discovery import _compact_analytic_description
+
+        assert _compact_analytic_description("Pitch", "Name: Pitch.") is None
+        assert _compact_analytic_description("Pitch", None) is None
+
+    def test_description_multiline_joined(self) -> None:
+        from ems_mcp.tools.discovery import _compact_analytic_description
+
+        assert _compact_analytic_description("X", "line one\n\nline two") == (
+            "line one; line two"
+        )
+
+    def test_physical_group_output_is_compact(self) -> None:
+        from ems_mcp.tools.discovery import _format_physical_group
+
+        data = {
+            "analytics": [
+                {
+                    "id": "H4sIAAAA-opaque",
+                    "name": "10TH BLEED SOLENOID CLOSE - SYS 1",
+                    "description": "Uid: SW2B211\nName: 10TH BLEED SOLENOID CLOSE - SYS 1.",
+                },
+                {
+                    "id": "H4sIAAAB-opaque",
+                    "name": "2.5 BLEED ACTUATOR FEEDBACK SYS. 1 (%)",
+                    "units": "%",
+                    "description": "Uid: BAF1\nName: 2.5 BLEED ACTUATOR FEEDBACK SYS. 1.",
+                },
+            ]
+        }
+        out = _format_physical_group(data, ems_system_id=1, group_id="RG.RawParameters")
+        assert "[unknown" not in out
+        assert "Name:" not in out
+        assert "    Uid: SW2B211" in out
+        assert "2.5 BLEED ACTUATOR FEEDBACK SYS. 1 (%) [%]" in out
+
+    def test_analytics_search_output_is_compact(self) -> None:
+        analytics = [
+            {
+                "id": "H4sIAAAA-opaque",
+                "name": "10TH BLEED SOLENOID CLOSE - SYS 1",
+                "description": "Uid: SW2B211\nName: 10TH BLEED SOLENOID CLOSE - SYS 1.",
+            }
+        ]
+        out = _format_analytics_search_results(analytics)
+        assert "[unknown" not in out
+        assert "Name:" not in out
+        assert "    Uid: SW2B211" in out

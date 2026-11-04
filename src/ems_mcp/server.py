@@ -113,7 +113,16 @@ quality filters (Takeoff Valid, Landing Valid, Processing State, etc.) \
 are applied automatically -- set apply_best_practice_filters=False only \
 when you explicitly want to include invalid/unprocessed records.
 - query_flight_analytics: Time-series data (altitude, airspeed, etc.) \
-for specific flights. Accepts human-readable analytic names.
+for specific flights. Accepts human-readable analytic names, or [N] \
+references from search_analytics / find_physical_params.
+- find_physical_params: discover PHYSICAL (raw FDR-recorded) parameters \
+for a specific flight. These are NOT in search_analytics (which only \
+covers global computed analytics) -- they are a property of the flight's \
+frame configuration, so a flight_id is required. Use this when a parameter \
+is fleet/frame-specific (raw bleed valves, individual sensor channels) or \
+when search_analytics returns nothing/NULLs for a flight. Pass the [N] \
+references it returns straight to query_flight_analytics with the same \
+flight_id.
 
 KEY RULES:
 - Discrete fields use numeric codes internally. Pass string labels in \

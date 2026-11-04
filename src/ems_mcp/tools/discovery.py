@@ -66,6 +66,12 @@ _result_store: dict[int, dict[str, Any]] = {}
 _next_ref: int = 0
 _STORE_MAX_SIZE: int = 500
 
+# Default analytic group holding raw/physical FDR parameters for a flight.
+# Proven entry point for the flight-scoped analytic-groups endpoint (matches
+# emspy's get_physical_parameter_list, which browses this group to enumerate
+# the raw parameters recorded by the aircraft's flight data recorder).
+_RAW_PARAMETERS_GROUP_ID: str = "RG.RawParameters"
+
 # Maximum concurrent EMS API requests issued by a single field-discovery call
 # (multi-term search fan-out and per-result get_field_info enrichment). Caps
 # how hard we hit the backend when an LLM hands us a long list of terms or a
@@ -883,6 +889,55 @@ def _format_field_info(field: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _analytic_type_label(analytic: dict[str, Any]) -> str:
+    """Build the bracketed type/units label for an analytic, omitting unknowns.
+
+    Physical parameters typically come back without a type, so rather than
+    printing ``[unknown]`` on every row the label is dropped (or reduced to
+    just the units) when the type is missing.
+    """
+    analytic_type = analytic.get("type")
+    if analytic_type == "unknown":
+        analytic_type = None
+    units = analytic.get("units")
+    if analytic_type and units:
+        return f" [{analytic_type} ({units})]"
+    if analytic_type or units:
+        return f" [{analytic_type or units}]"
+    return ""
+
+
+def _compact_analytic_description(name: str, description: str | None) -> str | None:
+    """Collapse an analytic description to one line, dropping name repeats.
+
+    Physical-parameter descriptions are multi-line, e.g.
+    ``"Uid: SW2B211\\nName: 10TH BLEED SOLENOID CLOSE - SYS 1."`` -- the
+    ``Name:`` line just repeats the parameter name. Lines that only restate
+    the name are removed and the rest are joined with ``"; "``.
+
+    Returns:
+        The compacted description, or None if nothing informative remains.
+    """
+    if not description:
+        return None
+    normalized_name = name.strip().rstrip(".").lower()
+    kept: list[str] = []
+    for line in description.splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        candidate = text.rstrip(".").lower()
+        if candidate.startswith("name:"):
+            # The analytic name may carry a units suffix the Name: line lacks,
+            # e.g. "... SYS. 1 (%)" vs "Name: ... SYS. 1."
+            if normalized_name.startswith(candidate[5:].strip()):
+                continue
+        elif candidate == normalized_name:
+            continue
+        kept.append(text)
+    return "; ".join(kept) or None
+
+
 def _format_analytics_search_results(
     analytics: list[dict[str, Any]],
     show_ids: bool = False,
@@ -903,16 +958,11 @@ def _format_analytics_search_results(
     for a in analytics:
         analytic_id = a.get("id", "?")
         analytic_name = a.get("name", "Unknown")
-        analytic_type = a.get("type", "unknown")
-        units = a.get("units")
-        description = a.get("description")
-
-        type_str = analytic_type
-        if units:
-            type_str = f"{analytic_type} ({units})"
+        type_str = _analytic_type_label(a)
+        description = _compact_analytic_description(analytic_name, a.get("description"))
 
         if show_ids:
-            lines.append(f"\n  {analytic_name} [{type_str}]")
+            lines.append(f"\n  {analytic_name}{type_str}")
             if description:
                 lines.append(f"    {description}")
             lines.append(f"    ID: {analytic_id}")
@@ -921,7 +971,7 @@ def _format_analytics_search_results(
                 analytic_name, analytic_id,
                 result_type="analytic", ems_system_id=ems_system_id,
             )
-            lines.append(f"\n  [{ref}] {analytic_name} [{type_str}]")
+            lines.append(f"\n  [{ref}] {analytic_name}{type_str}")
             if description:
                 lines.append(f"    {description}")
 
@@ -930,6 +980,82 @@ def _format_analytics_search_results(
             "\nYou can pass analytic names directly to query_flight_analytics."
         )
 
+    return "\n".join(lines)
+
+
+def _format_physical_group(
+    data: dict[str, Any],
+    ems_system_id: int,
+    group_id: str,
+    max_results: int = 50,
+    show_ids: bool = False,
+) -> str:
+    """Format a flight-scoped analytic-group response (physical parameters).
+
+    The flight-scoped ``analytic-groups`` endpoint returns a group's
+    ``analytics`` (raw FDR-recorded parameters available for this flight's
+    frame) plus child ``groups`` for further navigation.
+
+    Args:
+        data: Raw API response for the group.
+        ems_system_id: EMS system the browse ran against.
+        group_id: The group ID that was browsed.
+        max_results: Maximum analytics to list.
+        show_ids: If True, show full IDs inline instead of [N] references.
+    """
+    analytics = data.get("analytics") or []
+    subgroups = data.get("groups") or []
+    group_name = data.get("name") or group_id
+
+    if not analytics and not subgroups:
+        return (
+            f"Group '{group_name}' has no physical parameters or sub-groups "
+            "for this flight. Try a different group_id, or pass search_text "
+            "to search by keyword."
+        )
+
+    lines = [
+        f"Physical parameter group: {group_name}",
+        f"({len(analytics)} parameter(s), {len(subgroups)} sub-group(s))",
+    ]
+
+    for a in analytics[:max_results]:
+        analytic_id = a.get("id", "?")
+        analytic_name = a.get("name", "Unknown")
+        type_str = _analytic_type_label(a)
+        description = _compact_analytic_description(analytic_name, a.get("description"))
+        if show_ids:
+            lines.append(f"\n  {analytic_name}{type_str}")
+            if description:
+                lines.append(f"    {description}")
+            lines.append(f"    ID: {analytic_id}")
+        else:
+            ref = _store_result(
+                analytic_name, analytic_id,
+                result_type="analytic", ems_system_id=ems_system_id,
+            )
+            lines.append(f"\n  [{ref}] {analytic_name}{type_str}")
+            if description:
+                lines.append(f"    {description}")
+
+    if len(analytics) > max_results:
+        lines.append(
+            f"\n  ... {len(analytics) - max_results} more parameter(s). "
+            "Raise max_results or pass search_text to narrow."
+        )
+
+    if subgroups:
+        lines.append("\nSub-groups (pass the id as group_id to browse):")
+        for g in subgroups[:max_results]:
+            g_name = g.get("name", "Unknown")
+            g_id = g.get("id", "?")
+            lines.append(f"  {g_name}  (group_id: {g_id})")
+
+    if not show_ids and analytics:
+        lines.append(
+            "\nPass a [N] reference (with the same flight_id) to "
+            "query_flight_analytics to poll a parameter's values."
+        )
     return "\n".join(lines)
 
 
@@ -2688,6 +2814,113 @@ async def search_analytics(
         return f"Error: EMS system {ems_system_id} not found. Use list_ems_systems to find valid system IDs."
     except EMSAPIError as e:
         return f"Error searching analytics: {e.message}"
+
+
+@mcp.tool
+async def find_physical_params(
+    ems_system_id: int,
+    flight_id: int,
+    search_text: str | None = None,
+    group_id: str | None = None,
+    max_results: int = 50,
+    show_ids: bool = False,
+) -> str:
+    """Discover physical (raw FDR-recorded) parameters for a specific flight.
+
+    Physical parameters are the raw frame parameters recorded by the aircraft's
+    flight data recorder. Unlike the global computed analytics returned by
+    search_analytics, they are a property of an individual flight record's frame
+    configuration, so a flight_id is REQUIRED. Whether a given physical parameter
+    exists -- and returns data -- depends on that aircraft/frame layout, so the
+    same parameter may be present on one flight and absent on another.
+
+    Two modes:
+      * Keyword search (pass search_text): finds parameters whose name matches,
+        scoped to this flight's frame. e.g. search_text="bleed".
+      * Browse (omit search_text): lists the raw-parameter group's contents,
+        including sub-groups you can drill into by passing their id as group_id.
+
+    Results are assigned [N] references that you pass directly to
+    query_flight_analytics (with the same flight_id) to poll their values.
+
+    Args:
+        ems_system_id: EMS system ID.
+        flight_id: Flight record ID (from query_database). Physical parameters
+            are specific to this flight's frame configuration.
+        search_text: Optional keyword to match against parameter names. When
+            omitted, the tool browses the raw-parameter group instead.
+        group_id: Optional analytic group ID. In browse mode, defaults to the
+            raw parameters group ("RG.RawParameters"); pass a sub-group id from
+            a previous browse to drill in. In search mode, narrows the search.
+        max_results: Maximum results to return (default: 50).
+        show_ids: If True, show full IDs inline instead of [N] references.
+
+    Returns:
+        Matching physical parameters (and sub-groups when browsing), with [N]
+        references usable in query_flight_analytics.
+    """
+    client = get_client()
+
+    if search_text:
+        # Flight-scoped analytics search: returns analytics (including physical
+        # parameters) available in this flight's context, filtered server-side
+        # by name.
+        path = (
+            f"/api/v2/ems-systems/{ems_system_id}/flights/{flight_id}/analytics"
+        )
+        params: dict[str, str] = {"text": search_text}
+        if group_id:
+            params["groupId"] = group_id
+
+        cache_key = make_cache_key(
+            "phys_search", ems_system_id, flight_id, search_text.lower(),
+            group_id or "all",
+        )
+        cached = await field_cache.get(cache_key)
+        if cached is not None:
+            logger.debug("Using cached physical-param search: %s", cache_key)
+            return _format_analytics_search_results(
+                cached[:max_results], show_ids=show_ids,
+                ems_system_id=ems_system_id,
+            )
+
+        try:
+            analytics = await client.get(path, params=params)
+        except EMSNotFoundError:
+            return (
+                f"Error: flight {flight_id} not found in EMS system "
+                f"{ems_system_id}. Use query_database to find valid flight "
+                "record IDs."
+            )
+        except EMSAPIError as e:
+            return f"Error searching physical parameters: {e.message}"
+
+        await field_cache.set(cache_key, analytics)
+        return _format_analytics_search_results(
+            analytics[:max_results], show_ids=show_ids,
+            ems_system_id=ems_system_id,
+        )
+
+    # Browse mode: list the raw-parameter group's analytics and sub-groups.
+    gid = group_id or _RAW_PARAMETERS_GROUP_ID
+    path = (
+        f"/api/v2/ems-systems/{ems_system_id}/flights/{flight_id}/analytic-groups"
+    )
+    try:
+        data = await client.get(path, params={"analyticGroupId": gid})
+    except EMSNotFoundError:
+        return (
+            f"Error: flight {flight_id} or group '{gid}' not found in EMS "
+            f"system {ems_system_id}. Use query_database to find valid flight "
+            "record IDs."
+        )
+    except EMSAPIError as e:
+        return f"Error browsing physical parameters: {e.message}"
+
+    return _format_physical_group(
+        data, ems_system_id=ems_system_id, group_id=gid,
+        max_results=max_results, show_ids=show_ids,
+    )
 
 
 @mcp.tool
