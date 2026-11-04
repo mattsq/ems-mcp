@@ -3048,3 +3048,73 @@ class TestResolveDatabaseId:
         """Empty database reference should raise ValueError."""
         with pytest.raises(ValueError, match="cannot be empty"):
             await _resolve_database_id("", ems_system_id=1)
+
+
+class TestCompactAnalyticOutput:
+    """Physical-parameter output should not waste tokens on redundant text."""
+
+    def test_type_label_omits_unknown(self) -> None:
+        from ems_mcp.tools.discovery import _analytic_type_label
+
+        assert _analytic_type_label({}) == ""
+        assert _analytic_type_label({"type": "unknown"}) == ""
+        assert _analytic_type_label({"units": "%"}) == " [%]"
+        assert _analytic_type_label({"type": "number", "units": "ft"}) == " [number (ft)]"
+        assert _analytic_type_label({"type": "number"}) == " [number]"
+
+    def test_description_drops_name_repeat(self) -> None:
+        from ems_mcp.tools.discovery import _compact_analytic_description
+
+        name = "10TH BLEED SOLENOID CLOSE - SYS 1"
+        desc = "Uid: SW2B211\nName: 10TH BLEED SOLENOID CLOSE - SYS 1."
+        assert _compact_analytic_description(name, desc) == "Uid: SW2B211"
+
+    def test_description_only_name_becomes_none(self) -> None:
+        from ems_mcp.tools.discovery import _compact_analytic_description
+
+        assert _compact_analytic_description("Pitch", "Name: Pitch.") is None
+        assert _compact_analytic_description("Pitch", None) is None
+
+    def test_description_multiline_joined(self) -> None:
+        from ems_mcp.tools.discovery import _compact_analytic_description
+
+        assert _compact_analytic_description("X", "line one\n\nline two") == (
+            "line one; line two"
+        )
+
+    def test_physical_group_output_is_compact(self) -> None:
+        from ems_mcp.tools.discovery import _format_physical_group
+
+        data = {
+            "analytics": [
+                {
+                    "id": "H4sIAAAA-opaque",
+                    "name": "10TH BLEED SOLENOID CLOSE - SYS 1",
+                    "description": "Uid: SW2B211\nName: 10TH BLEED SOLENOID CLOSE - SYS 1.",
+                },
+                {
+                    "id": "H4sIAAAB-opaque",
+                    "name": "2.5 BLEED ACTUATOR FEEDBACK SYS. 1 (%)",
+                    "units": "%",
+                    "description": "Uid: BAF1\nName: 2.5 BLEED ACTUATOR FEEDBACK SYS. 1.",
+                },
+            ]
+        }
+        out = _format_physical_group(data, ems_system_id=1, group_id="RG.RawParameters")
+        assert "[unknown" not in out
+        assert "Name:" not in out
+        assert "    Uid: SW2B211" in out
+        assert "2.5 BLEED ACTUATOR FEEDBACK SYS. 1 (%) [%]" in out
+
+    def test_analytics_search_output_is_compact(self) -> None:
+        analytics = [
+            {
+                "id": "H4sIAAAA-opaque",
+                "name": "10TH BLEED SOLENOID CLOSE - SYS 1",
+                "description": "Uid: SW2B211\nName: 10TH BLEED SOLENOID CLOSE - SYS 1.",
+            }
+        ]
+        out = _format_analytics_search_results(analytics)
+        assert "[unknown" not in out
+        assert "Name:" not in out
+        assert "    Uid: SW2B211" in out

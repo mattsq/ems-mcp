@@ -889,6 +889,55 @@ def _format_field_info(field: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _analytic_type_label(analytic: dict[str, Any]) -> str:
+    """Build the bracketed type/units label for an analytic, omitting unknowns.
+
+    Physical parameters typically come back without a type, so rather than
+    printing ``[unknown]`` on every row the label is dropped (or reduced to
+    just the units) when the type is missing.
+    """
+    analytic_type = analytic.get("type")
+    if analytic_type == "unknown":
+        analytic_type = None
+    units = analytic.get("units")
+    if analytic_type and units:
+        return f" [{analytic_type} ({units})]"
+    if analytic_type or units:
+        return f" [{analytic_type or units}]"
+    return ""
+
+
+def _compact_analytic_description(name: str, description: str | None) -> str | None:
+    """Collapse an analytic description to one line, dropping name repeats.
+
+    Physical-parameter descriptions are multi-line, e.g.
+    ``"Uid: SW2B211\\nName: 10TH BLEED SOLENOID CLOSE - SYS 1."`` -- the
+    ``Name:`` line just repeats the parameter name. Lines that only restate
+    the name are removed and the rest are joined with ``"; "``.
+
+    Returns:
+        The compacted description, or None if nothing informative remains.
+    """
+    if not description:
+        return None
+    normalized_name = name.strip().rstrip(".").lower()
+    kept: list[str] = []
+    for line in description.splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        candidate = text.rstrip(".").lower()
+        if candidate.startswith("name:"):
+            # The analytic name may carry a units suffix the Name: line lacks,
+            # e.g. "... SYS. 1 (%)" vs "Name: ... SYS. 1."
+            if normalized_name.startswith(candidate[5:].strip()):
+                continue
+        elif candidate == normalized_name:
+            continue
+        kept.append(text)
+    return "; ".join(kept) or None
+
+
 def _format_analytics_search_results(
     analytics: list[dict[str, Any]],
     show_ids: bool = False,
@@ -909,16 +958,11 @@ def _format_analytics_search_results(
     for a in analytics:
         analytic_id = a.get("id", "?")
         analytic_name = a.get("name", "Unknown")
-        analytic_type = a.get("type", "unknown")
-        units = a.get("units")
-        description = a.get("description")
-
-        type_str = analytic_type
-        if units:
-            type_str = f"{analytic_type} ({units})"
+        type_str = _analytic_type_label(a)
+        description = _compact_analytic_description(analytic_name, a.get("description"))
 
         if show_ids:
-            lines.append(f"\n  {analytic_name} [{type_str}]")
+            lines.append(f"\n  {analytic_name}{type_str}")
             if description:
                 lines.append(f"    {description}")
             lines.append(f"    ID: {analytic_id}")
@@ -927,7 +971,7 @@ def _format_analytics_search_results(
                 analytic_name, analytic_id,
                 result_type="analytic", ems_system_id=ems_system_id,
             )
-            lines.append(f"\n  [{ref}] {analytic_name} [{type_str}]")
+            lines.append(f"\n  [{ref}] {analytic_name}{type_str}")
             if description:
                 lines.append(f"    {description}")
 
@@ -978,12 +1022,10 @@ def _format_physical_group(
     for a in analytics[:max_results]:
         analytic_id = a.get("id", "?")
         analytic_name = a.get("name", "Unknown")
-        analytic_type = a.get("type", "unknown")
-        units = a.get("units")
-        type_str = f"{analytic_type} ({units})" if units else analytic_type
-        description = a.get("description")
+        type_str = _analytic_type_label(a)
+        description = _compact_analytic_description(analytic_name, a.get("description"))
         if show_ids:
-            lines.append(f"\n  {analytic_name} [{type_str}]")
+            lines.append(f"\n  {analytic_name}{type_str}")
             if description:
                 lines.append(f"    {description}")
             lines.append(f"    ID: {analytic_id}")
@@ -992,7 +1034,7 @@ def _format_physical_group(
                 analytic_name, analytic_id,
                 result_type="analytic", ems_system_id=ems_system_id,
             )
-            lines.append(f"\n  [{ref}] {analytic_name} [{type_str}]")
+            lines.append(f"\n  [{ref}] {analytic_name}{type_str}")
             if description:
                 lines.append(f"    {description}")
 
