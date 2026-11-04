@@ -5,12 +5,52 @@ from datetime import datetime, timedelta, timezone
 from typing import Generator
 from unittest.mock import patch
 
+import keyring
 import pytest
+from keyring.backend import KeyringBackend
+from keyring.credentials import SimpleCredential
+from keyring.errors import PasswordDeleteError
 
 from ems_mcp.api.auth import TokenManager
 from ems_mcp.api.client import EMSClient
 from ems_mcp.api.models import CachedToken
 from ems_mcp.config import EMSSettings
+
+
+class InMemoryKeyring(KeyringBackend):
+    """Keyring backend that keeps credentials in a dict, for tests."""
+
+    priority = 1  # type: ignore[assignment]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.store: dict[tuple[str, str], str] = {}
+
+    def get_password(self, service: str, username: str) -> str | None:
+        return self.store.get((service, username))
+
+    def set_password(self, service: str, username: str, password: str) -> None:
+        self.store[(service, username)] = password
+
+    def delete_password(self, service: str, username: str) -> None:
+        if self.store.pop((service, username), None) is None:
+            raise PasswordDeleteError("not found")
+
+    def get_credential(self, service: str, username: str | None) -> SimpleCredential | None:
+        for (svc, user), password in self.store.items():
+            if svc == service and (username is None or user == username):
+                return SimpleCredential(user, password)
+        return None
+
+
+@pytest.fixture(autouse=True)
+def fake_keyring() -> Generator[InMemoryKeyring, None, None]:
+    """Replace the OS credential store so tests never touch real credentials."""
+    original = keyring.get_keyring()
+    backend = InMemoryKeyring()
+    keyring.set_keyring(backend)
+    yield backend
+    keyring.set_keyring(original)
 
 
 @pytest.fixture
